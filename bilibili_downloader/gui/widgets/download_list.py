@@ -1,7 +1,6 @@
 """Download list table widget with cancel and retry support."""
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -14,7 +13,6 @@ from PySide6.QtWidgets import (
 )
 
 from bilibili_downloader.core.models import VIDEO_CODEC_MAP, VideoQuality
-from bilibili_downloader.gui.resources.paths import asset_path
 
 # Shared button size (width, height)
 BTN_W = 68
@@ -82,7 +80,7 @@ class DownloadListWidget(QTableWidget):
 
     def _setup_ui(self):
         self.setColumnCount(5)
-        self.setHorizontalHeaderLabels(["作品", "规格", "传输进度", "任务状态", "操作"])
+        self.setHorizontalHeaderLabels(["视频", "规格", "进度", "状态", "操作"])
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
@@ -347,8 +345,7 @@ class DownloadListWidget(QTableWidget):
             return
         self._placeholder_active = True
         self.insertRow(0)
-        placeholder = QTableWidgetItem("  暂无任务 · 在上方解析作品后加入下载队列")
-        placeholder.setIcon(QIcon(asset_path("sparkle.png")))
+        placeholder = QTableWidgetItem("暂无任务 · 解析链接后加入下载队列")
         placeholder.setSizeHint(QSize(0, 54))
         placeholder.setTextAlignment(Qt.AlignCenter)
         placeholder.setForeground(Qt.gray)

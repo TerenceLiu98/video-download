@@ -20,8 +20,10 @@ Windows PowerShell 使用 `.\.venv\Scripts\Activate.ps1`。
 ```text
 bilibili_downloader/
 ├── api/          # API 客户端、WBI 签名与登录
+├── cli/          # 独立 CLI 子命令
 ├── core/         # 解析、下载、FFmpeg、弹幕、字幕与数据模型
 ├── gui/          # PySide6 窗口、对话框、控件、线程与视觉资源
+├── tui/          # Textual 终端界面、屏幕、控件与后台 worker
 └── utils/        # 配置和输入验证
 scripts/          # 可复现的资源构建脚本
 tests/            # 单元与回归测试

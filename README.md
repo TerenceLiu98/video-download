@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/itsVicOC/bilibili-downloader)](https://github.com/itsVicOC/bilibili-downloader/releases/latest)
 [![License](https://img.shields.io/github/license/itsVicOC/bilibili-downloader)](LICENSE)
 
-一款支持 GUI 和 CLI 的 B 站视频下载与原始资料归档工具。可以解析单个视频，也可以抓取 UP 主的完整投稿索引，按需保存元信息、封面、评论、弹幕和字幕。
+一款支持桌面 GUI、终端 TUI 和 CLI 的 B 站视频下载与原始资料归档工具。可以解析单个视频，也可以抓取 UP 主的完整投稿索引，按需保存元信息、封面、评论、弹幕和字幕。
 
 ![BiliFlow 夜间界面](docs/images/biliflow-dark.png)
 
@@ -55,6 +55,8 @@ Get-FileHash .\BilibiliDownloader-Windows-vX.Y.Z.zip -Algorithm SHA256
 - 网络解析、登录检查、封面加载与下载任务均在后台执行，避免阻塞界面。
 - 日间/夜间主题跟随系统设置实时切换，无需重启。
 - 提供二次元风格的 BiliFlow 桌面界面与跨平台应用图标。
+- 提供功能完整的终端界面，支持批量任务、UP 主索引、登录、设置和下载队列。
+- 缓存 UP 主批量任务的解析结果，并可从已有 `info.json` 离线重建缓存。
 
 日间界面预览：[docs/images/biliflow-light.png](docs/images/biliflow-light.png)。
 
@@ -82,6 +84,12 @@ python -m bilibili_downloader
 
 Windows PowerShell 使用 `.\.venv\Scripts\Activate.ps1` 激活环境。
 
+在终端中启动全屏 TUI：
+
+```bash
+python -m bilibili_downloader tui
+```
+
 CLI 示例：
 
 ```bash
@@ -104,6 +112,9 @@ python -m bilibili_downloader creator 123456 --output ./downloads
 python -m bilibili_downloader download-index \
   ./downloads/UP名称_123456/index.json \
   --all --comments --danmaku
+
+# 从既有归档重建解析缓存，不访问网络
+python -m bilibili_downloader rebuild-cache ./downloads/UP名称_123456
 ```
 
 运行 `python -m bilibili_downloader --help` 或阅读 [用户指南](docs/USER_GUIDE.md) 查看全部参数。

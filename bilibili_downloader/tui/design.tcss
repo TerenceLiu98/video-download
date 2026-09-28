@@ -1,0 +1,22 @@
+/* BiliFlow TUI — Indigo design (dark baseline).
+   Global styles. Per-widget styles live in each widget's DEFAULT_CSS.
+   Hex values mirror gui/resources/styles.py exactly. */
+
+Screen, App {
+    background: #0d0d0f;
+    color: #e8e8ec;
+}
+
+.primary { background: #6366f1; color: #ffffff; border: solid #7c7ff5; }
+
+/* --- Download queue (docked bottom, always visible) --- */
+DownloadQueue {
+    dock: bottom;
+    height: auto;
+    max-height: 42%;
+    background: #161619;
+    border-top: solid #26262b;
+    padding: 0 1;
+}
+DownloadQueue > .datatable--header { background: #121214; color: #6b6b75; }
+DownloadQueue > .datatable--cursor { background: #1e1e3a; color: #c7c9ff; }

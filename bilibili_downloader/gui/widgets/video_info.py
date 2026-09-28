@@ -18,6 +18,10 @@ from bilibili_downloader.utils.network import BILIBILI_RESOURCE_HOSTS, trusted_m
 MAX_COVER_BYTES = 10 * 1024 * 1024
 MAX_COVER_PIXELS = 25_000_000
 
+# Cover thumbnail size (16:9). Kept compact so the video-info panel does not
+# dominate the workspace and the download queue below stays roomy.
+COVER_W, COVER_H = 220, 124
+
 
 class _CoverLoadWorker(QObject):
     """Signals for async cover image loading."""
@@ -74,9 +78,9 @@ class VideoInfoWidget(QWidget):
         layout.setSpacing(13)
 
         header_layout = QHBoxLayout()
-        title = QLabel("作品资料卡")
+        title = QLabel("视频信息")
         title.setObjectName("SectionTitle")
-        self._state_label = QLabel("等待解析")
+        self._state_label = QLabel("待解析")
         self._state_label.setObjectName("StatusPill")
         header_layout.addWidget(title)
         header_layout.addStretch()
@@ -87,20 +91,20 @@ class VideoInfoWidget(QWidget):
         self._cover_label = QLabel()
         self._cover_label.setObjectName("EmptyCover")
         self._cover_label.setAlignment(Qt.AlignCenter)
-        self._cover_label.setFixedSize(300, 169)
+        self._cover_label.setFixedSize(COVER_W, COVER_H)
         placeholder = QIcon(asset_path("artist_palette.png")).pixmap(QSize(58, 58))
         self._cover_label.setPixmap(placeholder)
         self._cover_label.setToolTip("解析后显示视频封面")
         self._cover_label.setAlignment(Qt.AlignCenter)
 
         # Info labels
-        self._title_label = QLabel("等待新的次元旅程")
+        self._title_label = QLabel("粘贴链接并解析以显示视频信息")
         self._title_label.setObjectName("VideoTitle")
         self._title_label.setWordWrap(True)
 
-        self._author_label = QLabel("UP 主  --")
-        self._duration_label = QLabel("时长  --")
-        self._bvid_label = QLabel("BV 号  --")
+        self._author_label = QLabel("UP 主：—")
+        self._duration_label = QLabel("时长：—")
+        self._bvid_label = QLabel("BV号：—")
         for label in (self._author_label, self._duration_label, self._bvid_label):
             label.setObjectName("InfoChip")
 
@@ -112,7 +116,7 @@ class VideoInfoWidget(QWidget):
         info_layout = QVBoxLayout()
         info_layout.setSpacing(9)
         info_layout.addWidget(self._title_label)
-        subtitle = QLabel("解析完成后，可以在右侧选择画质和编码")
+        subtitle = QLabel("解析后可在右侧选择画质与编码")
         subtitle.setObjectName("MetaLabel")
         subtitle.setWordWrap(True)
         info_layout.addWidget(subtitle)
@@ -132,7 +136,7 @@ class VideoInfoWidget(QWidget):
         self._author_label.setText(f"UP 主  {info.author or '未知'}")
         self._duration_label.setText(f"时长  {info.duration_str}")
         self._bvid_label.setText(f"BV 号  {info.bvid}")
-        self._state_label.setText("READY")
+        self._state_label.setText("已解析")
 
         # Load cover image
         if info.cover_url:
@@ -157,7 +161,7 @@ class VideoInfoWidget(QWidget):
         pixmap = QPixmap()
         if pixmap.loadFromData(image_data):
             scaled = pixmap.scaled(
-                300, 169,
+                COVER_W, COVER_H,
                 Qt.KeepAspectRatioByExpanding,
                 Qt.SmoothTransformation,
             )

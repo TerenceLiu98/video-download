@@ -23,7 +23,7 @@ class BatchDialog(QDialog):
         super().__init__(parent)
         self._urls = []
 
-        self.setWindowTitle("批量任务舱")
+        self.setWindowTitle("批量任务")
         self.setMinimumSize(580, 460)
         self._setup_ui()
 
@@ -32,7 +32,7 @@ class BatchDialog(QDialog):
         layout.setContentsMargins(22, 20, 22, 20)
         layout.setSpacing(14)
 
-        title = QLabel("批量导入作品")
+        title = QLabel("批量导入链接")
         title.setObjectName("DialogTitle")
         caption = QLabel("每行一个 B 站链接、BV / AV 号或 b23.tv 短链")
         caption.setObjectName("DialogCaption")

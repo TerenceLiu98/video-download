@@ -52,11 +52,20 @@ class CreatorDialog(QDialog):
         title.setObjectName("DialogTitle")
         layout.addWidget(title)
 
+        hint = QLabel(
+            "① 在下方输入 UID 或空间链接，点「开始抓取」即可拉取全部投稿；"
+            "② 已有 index.json 时点「导入 index.json」直接载入，无需联网。"
+        )
+        hint.setObjectName("MetaLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
         source_row = QHBoxLayout()
         self._source = QLineEdit()
         self._source.setPlaceholderText("输入 UID 或 space.bilibili.com 空间链接")
+        self._source.returnPressed.connect(self._fetch)
         source_row.addWidget(self._source, 1)
-        self._fetch_button = QPushButton("刷新索引")
+        self._fetch_button = QPushButton("开始抓取")
         self._fetch_button.setObjectName("PrimaryButton")
         self._fetch_button.clicked.connect(self._fetch)
         source_row.addWidget(self._fetch_button)

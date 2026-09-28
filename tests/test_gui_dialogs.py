@@ -69,7 +69,7 @@ def test_main_window_separates_download_and_service_pools(qtbot, monkeypatch):
     assert window.minimumHeight() == 640
 
     controls = window.findChild(QWidget, "ControlPanel")
-    assert controls.minimumHeight() == 340
+    assert controls.minimumHeight() == 240
     assert controls.layout().verticalSpacing() == 8
 
 
