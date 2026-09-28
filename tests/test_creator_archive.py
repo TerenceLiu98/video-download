@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from bilibili_downloader.core.archive import (
     ArtifactPaths,
     CommentArchiveDownloader,
@@ -142,6 +144,50 @@ def test_creator_index_retries_http_412(monkeypatch):
     assert len(index.videos) == 3
     assert attempts == 1
     assert statuses == ["第 2 页触发 B站风控，0 秒后重试"]
+
+
+def test_creator_index_retries_premature_empty_page_and_saves_latest_checkpoint():
+    class PrematureEmptyAPI(FakeCreatorAPI):
+        def __init__(self):
+            self.page_two_attempts = 0
+
+        def get_creator_medialist_page(self, mid, cursor, page_size):
+            if cursor == 2:
+                self.page_two_attempts += 1
+                return {
+                    "code": 0,
+                    "data": {
+                        "total_count": 3,
+                        "has_more": False,
+                        "media_list": [],
+                    },
+                }
+            return super().get_creator_medialist_page(mid, cursor, page_size)
+
+    api = PrematureEmptyAPI()
+    checkpoints = []
+    statuses = []
+
+    with pytest.raises(RuntimeError, match="连续返回空数据"):
+        CreatorIndexService(
+            api,
+            page_size=2,
+            request_interval=0,
+            retry_delays=(0, 0),
+        ).fetch(
+            "123",
+            checkpoint_callback=checkpoints.append,
+            status_callback=statuses.append,
+        )
+
+    assert api.page_two_attempts == 3
+    assert len(statuses) == 2
+    assert checkpoints[-1].complete is False
+    assert checkpoints[-1].next_cursor == 2
+    assert [video.bvid for video in checkpoints[-1].videos] == [
+        "BV0000000001",
+        "BV0000000002",
+    ]
 
 
 def test_cover_download_upgrades_trusted_http_url(monkeypatch, tmp_path):

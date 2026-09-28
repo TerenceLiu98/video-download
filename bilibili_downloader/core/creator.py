@@ -127,14 +127,31 @@ class CreatorIndexService:
                 wait_time = interval - (time.monotonic() - last_request_at)
                 if wait_time > 0:
                     _cancellable_wait(wait_time, cancel_checker)
-            payload = self._fetch_page_with_retry(
-                mid,
-                page,
-                cursor,
-                len(videos),
-                cancel_checker,
-                status_callback,
-            )
+            try:
+                payload = self._fetch_page_with_retry(
+                    mid,
+                    page,
+                    cursor,
+                    len(videos),
+                    expected_total,
+                    cancel_checker,
+                    status_callback,
+                )
+            except Exception:
+                if checkpoint_callback and videos and cursor:
+                    checkpoint_callback(
+                        _build_creator_index(
+                            mid,
+                            name,
+                            source,
+                            videos,
+                            raw_pages,
+                            expected_total,
+                            complete=False,
+                            next_cursor=cursor,
+                        )
+                    )
+                raise
             last_request_at = time.monotonic()
             raw_pages.append(payload)
             data = payload.get("data") or {}
@@ -198,18 +215,32 @@ class CreatorIndexService:
         page: int,
         cursor: int,
         fetched: int,
+        expected_total: int,
         cancel_checker: Optional[Callable[[], bool]],
         status_callback: Optional[Callable[[str], None]],
     ) -> dict:
         for attempt in range(len(self._retry_delays) + 1):
             try:
-                return self._api_client.get_creator_medialist_page(
+                payload = self._api_client.get_creator_medialist_page(
                     mid, cursor, self._page_size
                 )
+                data = payload.get("data") or {}
+                entries = data.get("media_list") or []
+                if not entries and expected_total > fetched:
+                    raise _PrematureEmptyPageError(
+                        f"expected {expected_total} submissions, received {fetched}"
+                    )
+                return payload
             except Exception as exc:
                 if not _retryable_creator_error(exc):
                     raise
                 if attempt >= len(self._retry_delays):
+                    if isinstance(exc, _PrematureEmptyPageError):
+                        raise RuntimeError(
+                            f"UP 主索引第 {page} 页连续返回空数据；服务端报告 "
+                            f"{expected_total} 个投稿，当前仅获取 {fetched} 个。"
+                            "已保存检查点，请稍后继续刷新索引"
+                        ) from exc
                     raise RuntimeError(
                         f"B站在索引第 {page} 页触发访问风控；已获取 {fetched} 个投稿。"
                         "请保留登录状态，稍后重新刷新索引"
@@ -287,11 +318,17 @@ def _safe_int(value: object) -> int:
 
 
 def _retryable_creator_error(exc: Exception) -> bool:
+    if isinstance(exc, _PrematureEmptyPageError):
+        return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (412, 429)
     if isinstance(exc, BilibiliAPIError):
         return exc.code in (-401, -352)
     return isinstance(exc, httpx.TransportError)
+
+
+class _PrematureEmptyPageError(RuntimeError):
+    """The cursor API returned an empty page before its reported total."""
 
 
 def _cancellable_wait(
