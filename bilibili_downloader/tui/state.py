@@ -41,6 +41,18 @@ class LoginState:
 
 
 @dataclass
+class BatchJob:
+    batch_id: int
+    total: int
+    output_dir: str
+    done: int = 0
+    failed: int = 0
+    running: bool = True
+    status: str = "解析中"
+    worker: Optional[object] = None
+
+
+@dataclass
 class AppState:
     config: "ConfigManager"
     settings: "AppSettings"

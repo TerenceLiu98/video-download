@@ -40,7 +40,7 @@ class BatchWorker(CoreWorker):
     def __init__(self, app, client, urls, flags: dict,
                  quality=None, codec=None,
                  creator_mid: int = 0, creator_name: str = "",
-                 cache=None):
+                 cache=None, batch_id: int = 0):
         super().__init__(app)
         self._client = client
         self._urls = urls
@@ -50,6 +50,11 @@ class BatchWorker(CoreWorker):
         self._creator_mid = creator_mid
         self._creator_name = creator_name
         self._cache = cache
+        self.batch_id = batch_id
+
+    def emit(self, message) -> None:
+        message.batch_id = self.batch_id
+        super().emit(message)
 
     def run(self) -> None:
         from bilibili_downloader.core.batch import BatchResolver
@@ -77,6 +82,8 @@ class BatchWorker(CoreWorker):
             if info is not None:
                 pages = [info.for_page(p) for p in info.pages] if info.is_multi_part else [info]
                 for pi in pages:
+                    if self._cancel.is_set():
+                        break
                     item = DownloadItem(
                         video_info=pi,
                         selected_quality=self._quality,
@@ -94,7 +101,7 @@ class BatchWorker(CoreWorker):
                     self.emit(messages.BatchItemReady(item))
             # Pace between items so we don't trip rate limits on long indexes.
             if index < total and not self._cancel.is_set():
-                _sleep(random.uniform(*_INTER_RESOLVE_RANGE))
+                self._cancellable_wait(random.uniform(*_INTER_RESOLVE_RANGE))
             self.emit(messages.BatchProgress(index, total))
 
         # Persist cache if it was updated.

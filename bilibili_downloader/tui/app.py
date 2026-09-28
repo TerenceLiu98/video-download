@@ -18,6 +18,7 @@ import threading
 
 from textual import on, work
 from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Button
 
 from bilibili_downloader.api.client import BilibiliAPIClient
@@ -28,12 +29,13 @@ from bilibili_downloader.tui.screens.creator_screen import CreatorScreen
 from bilibili_downloader.tui.screens.help_screen import HelpScreen
 from bilibili_downloader.tui.screens.login_screen import LoginScreen
 from bilibili_downloader.tui.screens.main_screen import MainScreen
-from bilibili_downloader.tui.state import AppState, LoginState
+from bilibili_downloader.tui.state import AppState, BatchJob, LoginState
 from bilibili_downloader.tui.widgets.download_queue import (
     DownloadQueue,
     DownloadQueueModel,
 )
 from bilibili_downloader.tui.widgets.sidebar import NavSidebar
+from bilibili_downloader.tui.widgets.task_workspace import TaskWorkspace
 from bilibili_downloader.tui.workers.batch import BatchWorker
 from bilibili_downloader.tui.workers.creator import CreatorIndexWorker
 from bilibili_downloader.tui.workers.download import DownloadWorker
@@ -87,9 +89,12 @@ class BiliFlowTUI(App):
 
     # --- lifecycle ---
     def compose(self) -> ComposeResult:
-        yield NavSidebar()
-        yield MainScreen()
-        yield DownloadQueue(self._model)
+        with Horizontal(id="workspace-shell"):
+            yield NavSidebar()
+            with Vertical(id="workspace-main"):
+                yield MainScreen()
+                yield TaskWorkspace(self._model)
+                yield Button("下载任务 0", id="background-status")
 
     def on_mount(self) -> None:
         config = ConfigManager()
@@ -97,6 +102,15 @@ class BiliFlowTUI(App):
         client = BilibiliAPIClient(sessdata=settings.sessdata or None)
         self.state = AppState(config=config, settings=settings, api_client=client, queue=self._model)
         self._semaphore = threading.Semaphore(max(1, settings.max_concurrent_downloads))
+        self._task_path = config.task_path
+        try:
+            self._model.restore(self._task_path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._task_path = None
+            self.notify(f"任务记录读取失败，保留原文件：{exc}", severity="error")
+        self._refresh_queue()
+        self._show_workspace("home")
+        self.set_interval(2, self._save_queue)
 
         # Sidebar control panel defaults from settings.
         self._control_panel().sync_defaults_from_settings(settings)
@@ -110,6 +124,9 @@ class BiliFlowTUI(App):
         self._semaphore: threading.Semaphore | None = None
         self._model = DownloadQueueModel()
         self._creator_worker = None
+        self._task_path = None
+        self._batch_jobs: dict[int, BatchJob] = {}
+        self._quitting = False
 
     # --- helpers to reach widgets ---
     def _sidebar(self) -> NavSidebar:
@@ -138,8 +155,10 @@ class BiliFlowTUI(App):
         if btn_id == "login-btn":
             self._open_login()
         elif btn_id == "nav-home":
-            pass
-        elif btn_id in ("nav-batch", "batch-btn"):
+            self._show_workspace("home")
+        elif btn_id in ("nav-batch", "background-status"):
+            self._show_workspace("tasks")
+        elif btn_id == "batch-btn":
             self._open_batch()
         elif btn_id in ("nav-creator", "creator-btn"):
             self._open_creator()
@@ -151,6 +170,18 @@ class BiliFlowTUI(App):
             self._start_download()
 
     # --- batch ---
+    def _show_workspace(self, page: str) -> None:
+        tasks = page == "tasks"
+        self.query_one(MainScreen).display = not tasks
+        self.query_one(TaskWorkspace).display = tasks
+        self.query_one("#background-status").display = not tasks
+        self.query_one("#nav-home").set_class(not tasks, "--active")
+        self.query_one("#nav-batch").set_class(tasks, "--active")
+        if tasks:
+            self.query_one(DownloadQueue).focus()
+        else:
+            self._url_input().focus()
+
     def _open_batch(self) -> None:
         self.push_screen(BatchScreen(), self._handle_batch_result)
 
@@ -170,50 +201,86 @@ class BiliFlowTUI(App):
         flags["embed_metadata"] = self.state.settings.embed_metadata
         flags["embed_cover"] = self.state.settings.embed_cover
         n = len(urls)
-        self.notify(f"正在批量解析 {n} 个链接…")
+        batch_id = max(self._batch_jobs, default=0) + 1
+        self._batch_jobs[batch_id] = BatchJob(batch_id, n, self.state.settings.output_dir)
+        self._show_workspace("tasks")
+        self._refresh_task_summary()
+        self.notify(f"已提交 {n} 个链接，正在后台解析")
         self.start_batch(urls, flags, quality, codec,
                          creator_mid=(creator_index.mid if creator_index else 0),
                          creator_name=(creator_index.name if creator_index else ""),
-                         creator_index=creator_index)
+                         creator_index=creator_index, batch_id=batch_id)
 
     @work(thread=True, group="batch")
-    def start_batch(self, urls, flags, quality, codec, creator_mid=0, creator_name="", creator_index=None) -> None:
+    def start_batch(self, urls, flags, quality, codec, creator_mid=0, creator_name="", creator_index=None, batch_id=0) -> None:
         assert self.state is not None
         from bilibili_downloader.core.models import VideoQuality
         from bilibili_downloader.tui.resolve_cache import ResolveCache
 
         q = VideoQuality(quality) if quality and not isinstance(quality, VideoQuality) else quality
-        cache = ResolveCache.for_creator(self.state.settings.output_dir, creator_index) if creator_index else None
-        BatchWorker(
-            self, self.state.api_client, urls, flags,
-            quality=q, codec=codec, creator_mid=creator_mid, creator_name=creator_name, cache=cache,
-        ).run()
+        job = self._batch_jobs.get(batch_id)
+        output_dir = job.output_dir if job else self.state.settings.output_dir
+        try:
+            cache = ResolveCache.for_creator(output_dir, creator_index) if creator_index else None
+            worker = BatchWorker(
+                self, self.state.api_client, urls, flags,
+                quality=q, codec=codec, creator_mid=creator_mid, creator_name=creator_name,
+                cache=cache, batch_id=batch_id,
+            )
+            if job:
+                job.worker = worker
+            if self._quitting:
+                worker.cancel()
+            worker.run()
+        except Exception as exc:  # noqa: BLE001
+            message = messages.BatchDone(str(exc))
+            message.batch_id = batch_id
+            self.post_message(message)
 
     @on(messages.BatchItemReady)
     def _on_batch_item_ready(self, message: messages.BatchItemReady) -> None:
-        self.enqueue_download(message.item)
+        if self._quitting:
+            return
+        job = self._batch_jobs.get(message.batch_id)
+        self.enqueue_download(message.item, job.output_dir if job else None)
 
     @on(messages.BatchItemFailed)
     def _on_batch_item_failed(self, message: messages.BatchItemFailed) -> None:
         assert self.state is not None
         self.state.queue.add_error(message.error)
+        job = self._batch_jobs.get(message.batch_id)
+        if job:
+            job.failed += 1
         self._refresh_queue()
 
     @on(messages.BatchProgress)
     def _on_batch_progress(self, message: messages.BatchProgress) -> None:
-        """Only notify on completion to avoid spam for large indexes."""
-        if message.done == message.total:
-            self.notify(f"批量解析完成 {message.total} 条", severity="information")
+        job = self._batch_jobs.get(message.batch_id)
+        if job:
+            job.done = message.done
+            job.status = "解析中"
+        self._refresh_task_summary()
 
     @on(messages.BatchItemRetrying)
     def _on_batch_item_retrying(self, message: messages.BatchItemRetrying) -> None:
         """User-visible backoff feedback for 风控 retries."""
-        self.notify(f"{message.source} 触发风控，第{message.attempt}次重试（等待 {message.delay:g}s）", severity="warning")
+        job = self._batch_jobs.get(message.batch_id)
+        if job:
+            job.status = f"风控重试 {message.attempt} · 等待 {message.delay:g}s"
+        self._refresh_task_summary()
 
     @on(messages.BatchDone)
     def _on_batch_done_msg(self, message: messages.BatchDone) -> None:
-        # BatchProgress now handles completion notification, so we suppress this to avoid duplicate toasts.
-        pass
+        job = self._batch_jobs.get(message.batch_id)
+        if job:
+            job.running = False
+            job.worker = None
+            job.status = f"中断：{message.error}" if message.error else "解析完成"
+        self._refresh_task_summary()
+        if message.error:
+            self.notify(f"批量导入中断：{message.error}", severity="error")
+        elif job:
+            self.notify(f"批量解析完成 {job.done}/{job.total} · 失败 {job.failed}")
 
     # --- creator ---
     def _open_creator(self) -> None:
@@ -442,34 +509,42 @@ class BiliFlowTUI(App):
             self.enqueue_download(item)
         self.notify(f"已加入 {len(infos)} 个下载任务")
 
-    def enqueue_download(self, item) -> None:
+    def enqueue_download(self, item, output_dir: str | None = None) -> None:
         assert self.state is not None
-        download_id = self.state.queue.add(item)
+        download_id = self.state.queue.add(item, output_dir or self.state.settings.output_dir)
         self._refresh_queue()
-        self.run_download_worker(download_id, item)
+        self._launch_download(download_id, item)
+        self._refresh_task_summary()
 
-    @work(thread=True, group="download")
-    def run_download_worker(self, download_id: int, item) -> None:
+    def _launch_download(self, download_id: int, item) -> None:
         assert self.state is not None and self._semaphore is not None
         worker = DownloadWorker(
             self,
             self.state.api_client,
             item,
-            self.state.settings.output_dir,
+            self.state.queue.get(download_id).output_dir or self.state.settings.output_dir,
             download_id,
             self.state.settings.ffmpeg_path or None,
         )
         self.state.queue.register_worker(download_id, worker)
-        self._semaphore.acquire()
+        self.run_download_worker(worker, self._semaphore)
+
+    @work(thread=True, group="download")
+    def run_download_worker(self, worker, semaphore) -> None:
+        while not semaphore.acquire(timeout=0.1):
+            if worker.cancel_checker():
+                worker.run()
+                return
         try:
             worker.run()
         finally:
-            self._semaphore.release()
+            semaphore.release()
 
     @on(messages.DownloadProgress)
     def _on_download_progress(self, message: messages.DownloadProgress) -> None:
         assert self.state is not None
-        self.state.queue.set_progress(message.download_id, message.pct, message.status_text)
+        self.state.queue.set_progress(message.download_id, message.pct, message.status_text,
+                                      message.speed_bps, message.eta_seconds)
         # Per-tick progress repaints only the changed row; structural events
         # (add/done/failed/cancel) still use the full refresh in _refresh_queue.
         # If the incremental update can't locate the row (e.g. it was added this
@@ -480,6 +555,7 @@ class BiliFlowTUI(App):
         except Exception:  # noqa: BLE001
             logger.debug("incremental row refresh failed, falling back", exc_info=True)
             self._refresh_queue()
+        self._refresh_task_summary()
 
     @on(messages.DownloadFinished)
     def _on_download_finished(self, message: messages.DownloadFinished) -> None:
@@ -506,10 +582,43 @@ class BiliFlowTUI(App):
         self._refresh_queue()
 
     def _refresh_queue(self) -> None:
+        self._save_queue()
         try:
             self.query_one(DownloadQueue).refresh_model()
+            self._refresh_task_summary()
         except Exception:  # noqa: BLE001
             pass
+
+    def _refresh_task_summary(self) -> None:
+        from collections import Counter
+
+        rows = self._model.rows()
+        counts = Counter(r.state for r in rows)
+        speed = sum(r.speed_bps for r in rows if r.state == "downloading")
+        summary = (f"下载任务 {len(rows)} · 下载中 {counts['downloading']} · "
+                   f"等待 {counts['pending'] + counts['retry']} · "
+                   f"异常 {counts['failed'] + counts['error'] + counts['partial']} · "
+                   f"完成 {counts['done']} · {speed / 1048576:.1f} MiB/s")
+        jobs = list(self._batch_jobs.values())
+        running = [j for j in jobs if j.running]
+        shown = running or jobs[-1:]
+        imports = "\n".join(
+            f"导入 #{j.batch_id} · {j.done}/{j.total} · 失败 {j.failed} · {j.status}"
+            for j in shown
+        )
+        self.query_one(TaskWorkspace).update_summary(summary, imports)
+        self.query_one("#background-status", Button).label = (
+            f"后台导入 {len(running)} · 下载 {counts['downloading']} · "
+            f"等待 {counts['pending'] + counts['retry']} · 查看任务"
+        )
+
+    def _save_queue(self) -> None:
+        if self._task_path is not None:
+            try:
+                self._model.save(self._task_path)
+            except OSError as exc:
+                self.notify(f"任务记录保存失败：{exc}", severity="error")
+                self._task_path = None
 
     # --- queue key actions (cancel / retry / delete) ---
     @on(DownloadQueue.QueueAction)
@@ -519,31 +628,71 @@ class BiliFlowTUI(App):
         did = message.download_id
         if action == "cancel_all":
             self.state.queue.cancel_all()
-            self.notify("已请求取消所有任务")
+            self.notify("已请求暂停所有任务")
+        elif action == "resume_all":
+            for row in self._model.rows():
+                if row.state in ("paused", "cancelled"):
+                    self._retry_download(row.download_id)
+        elif action == "clear_done":
+            for row in self._model.rows():
+                if row.state == "done":
+                    self._model.delete(row.download_id)
+        elif action == "open":
+            self._open_task_directory(did)
         elif action == "cancel":
             self.state.queue.cancel(did)
         elif action == "delete":
+            if self.state.queue.get_worker(did) is not None:
+                self.notify("请先暂停任务再删除", severity="warning")
+                return
             self.state.queue.delete(did)
         elif action == "retry":
             self._retry_download(did)
         self._refresh_queue()
 
+    def _open_task_directory(self, download_id: int) -> None:
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        row = self._model.get(download_id)
+        if row is None:
+            return
+        directory = Path(row.video_path).parent if row.video_path else Path(row.output_dir)
+        if not directory.is_dir():
+            self.notify("保存目录不存在", severity="warning")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(directory))
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(directory)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.notify(f"无法打开目录：{exc}", severity="error")
+
     def _retry_download(self, download_id: int) -> None:
         assert self.state is not None
+        row = self.state.queue.get(download_id)
+        if row is None or row.state not in ("failed", "paused", "cancelled"):
+            return
+        if self.state.queue.get_worker(download_id) is not None:
+            return
         item = self.state.queue.get_item(download_id)
         if item is None:
             self.notify("无法重试该任务", severity="warning")
             return
         self.state.queue.mark_retry(download_id)
         self._refresh_queue()
-        self.run_download_worker(download_id, item)
+        self._launch_download(download_id, item)
 
     # --- quit confirmation (parity with MainWindow.closeEvent) ---
     def action_quit(self) -> None:
         assert self.state is not None
-        if self.state.queue.has_active:
+        if self.state.queue.has_active or any(j.running for j in self._batch_jobs.values()):
             self.push_screen(
-                ConfirmScreen("仍有下载任务正在运行。退出将保留断点数据，确认停止并退出吗？"),
+                ConfirmScreen("仍有导入或下载正在运行。退出将停止未完成的解析，保留已入队任务和下载断点，确认退出吗？"),
                 self._on_quit_confirm,
             )
         else:
@@ -555,7 +704,12 @@ class BiliFlowTUI(App):
 
     def _do_quit(self) -> None:
         assert self.state is not None
+        self._quitting = True
+        for job in self._batch_jobs.values():
+            if job.worker is not None:
+                job.worker.cancel()
         self.state.queue.cancel_all()
+        self._save_queue()
         try:
             self.state.api_client.close()
         except Exception:  # noqa: BLE001

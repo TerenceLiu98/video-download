@@ -19,6 +19,37 @@ def test_stream_urls_deduplicates_base_and_backups():
     assert _stream_urls(stream) == ["base", "backup"]
 
 
+def test_transfer_metrics_exclude_resumed_bytes(monkeypatch, tmp_path):
+    downloader = StreamDownloader(object(), str(tmp_path))
+    dest = tmp_path / "video.m4s"
+    dest.write_bytes(b"x" * 65536)
+    ticks = iter((0.0, 1.0, 2.0))
+    monkeypatch.setattr("bilibili_downloader.core.downloader.time.monotonic", lambda: next(ticks))
+    response = httpx.Response(
+        206, headers={"content-range": "bytes 65536-196607/196608"},
+        content=b"y" * 131072, request=httpx.Request("GET", "https://example.com"),
+    )
+    metrics = []
+    downloader._write_response(
+        response, dest, 65536,
+        lambda p: metrics.append((p, downloader.speed_bps, downloader.eta_seconds)),
+    )
+    assert metrics[0][1:] == (65536, 1)
+    assert dest.stat().st_size == 196608
+
+
+def test_truncated_media_is_not_marked_complete(tmp_path):
+    downloader = StreamDownloader(object(), str(tmp_path))
+    response = httpx.Response(
+        200, headers={"content-length": "10"}, content=b"short",
+        request=httpx.Request("GET", "https://example.com"),
+    )
+    dest = tmp_path / "video.m4s"
+    with pytest.raises(httpx.ProtocolError, match="不完整"):
+        downloader._write_response(response, dest, 0, lambda p: None)
+    assert dest.read_bytes() == b"short"
+
+
 def test_download_stream_falls_back_to_backup_url(monkeypatch, tmp_path):
     downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path), max_retries=1)
     calls = []

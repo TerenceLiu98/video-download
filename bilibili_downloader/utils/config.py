@@ -99,6 +99,10 @@ class ConfigManager:
         self._uses_default_path = config_path is None
         self._settings: Optional[AppSettings] = None
 
+    @property
+    def task_path(self) -> Path:
+        return self._config_path.with_name("tui-tasks.json")
+
     def load(self) -> AppSettings:
         """Load settings from disk, or return defaults."""
         if self._settings is not None:

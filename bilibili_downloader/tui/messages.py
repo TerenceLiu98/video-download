@@ -30,11 +30,14 @@ class ResolveFailed(Message):
 
 # --- Download --------------------------------------------------------------
 class DownloadProgress(Message):
-    def __init__(self, download_id: int, pct: float, status_text: str):
+    def __init__(self, download_id: int, pct: float, status_text: str,
+                 speed_bps: float = 0.0, eta_seconds: float | None = None):
         super().__init__()
         self.download_id = download_id
         self.pct = pct
         self.status_text = status_text
+        self.speed_bps = speed_bps
+        self.eta_seconds = eta_seconds
 
 
 class DownloadFinished(Message):
@@ -58,19 +61,25 @@ class DownloadCancelled(Message):
 
 
 # --- Batch -----------------------------------------------------------------
-class BatchItemReady(Message):
+class BatchEvent(Message):
+    def __init__(self):
+        super().__init__()
+        self.batch_id = 0
+
+
+class BatchItemReady(BatchEvent):
     def __init__(self, item):
         super().__init__()
         self.item = item
 
 
-class BatchItemFailed(Message):
+class BatchItemFailed(BatchEvent):
     def __init__(self, error: str):
         super().__init__()
         self.error = error
 
 
-class BatchItemRetrying(Message):
+class BatchItemRetrying(BatchEvent):
     """A transient/风控 error hit during batch resolve; backing off + retrying."""
 
     def __init__(self, source: str, attempt: int, delay: float):
@@ -80,7 +89,7 @@ class BatchItemRetrying(Message):
         self.delay = delay
 
 
-class BatchProgress(Message):
+class BatchProgress(BatchEvent):
     """How many of the batch inputs have been resolved so far."""
 
     def __init__(self, done: int, total: int):
@@ -89,8 +98,10 @@ class BatchProgress(Message):
         self.total = total
 
 
-class BatchDone(Message):
-    pass
+class BatchDone(BatchEvent):
+    def __init__(self, error: str = ""):
+        super().__init__()
+        self.error = error
 
 
 # --- Creator ---------------------------------------------------------------

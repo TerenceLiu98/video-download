@@ -9,14 +9,23 @@ Screen, App {
 
 .primary { background: #6366f1; color: #ffffff; border: solid #7c7ff5; }
 
-/* --- Download queue (docked bottom, always visible) --- */
+MainScreen { height: 1fr; }
+#workspace-shell { height: 1fr; width: 1fr; }
+#workspace-main { height: 1fr; width: 1fr; }
+#background-status {
+    width: 1fr;
+    height: 3;
+    background: #173b3b;
+    color: #e8e8ec;
+}
+
+/* The queue fills the task workspace. */
 DownloadQueue {
-    dock: bottom;
-    height: auto;
-    max-height: 42%;
+    height: 1fr;
+    min-height: 3;
     background: #161619;
     border-top: solid #26262b;
     padding: 0 1;
 }
 DownloadQueue > .datatable--header { background: #121214; color: #6b6b75; }
-DownloadQueue > .datatable--cursor { background: #1e1e3a; color: #c7c9ff; }
+DownloadQueue > .datatable--cursor { background: #173b3b; color: #e8e8ec; }

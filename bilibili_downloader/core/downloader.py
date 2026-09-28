@@ -58,6 +58,8 @@ class StreamDownloader:
         self._max_retries = max(1, max_retries)
         self._ffmpeg_path = ffmpeg_path
         self._cancelled = False
+        self.speed_bps = 0.0
+        self.eta_seconds = None
         self.last_video_stream: Optional[StreamInfo] = None
         self.last_audio_stream: Optional[StreamInfo] = None
         self.last_download_skipped = False
@@ -171,6 +173,8 @@ class StreamDownloader:
                 raise RuntimeError("Download cancelled by user")
 
             # Merge with FFmpeg
+            self.speed_bps = 0.0
+            self.eta_seconds = None
             progress_callback(0.82, "正在合并视频...")
             merged_path = tmp / "merged.mp4"
             merge_kwargs = {}
@@ -380,18 +384,36 @@ class StreamDownloader:
         mode = "ab" if append else "wb"
 
         last_reported = -1.0
+        sampled_at = time.monotonic()
+        sampled_bytes = downloaded
+        self.speed_bps = 0.0
+        self.eta_seconds = None
         with open(dest, mode) as f:
             for chunk in response.iter_bytes(chunk_size=65536):
                 if self._cancelled:
                     raise RuntimeError("Download cancelled")
                 f.write(chunk)
                 downloaded += len(chunk)
+                now = time.monotonic()
+                elapsed = now - sampled_at
+                if elapsed >= 0.5:
+                    self.speed_bps = (downloaded - sampled_bytes) / elapsed
+                    self.eta_seconds = (
+                        max(0, total - downloaded) / self.speed_bps
+                        if total > 0 and self.speed_bps > 0 else None
+                    )
                 if total > 0:
                     pct = min(downloaded / total, 1.0)
-                    if pct - last_reported >= 0.05 or pct >= 1.0:
+                    if elapsed >= 0.5 or pct - last_reported >= 0.05 or pct >= 1.0:
                         progress_callback(pct)
                         last_reported = pct
+                elif elapsed >= 0.5:
+                    progress_callback(0.0)
+                if elapsed >= 0.5:
+                    sampled_at, sampled_bytes = now, downloaded
 
+        if total > 0 and downloaded != total:
+            raise httpx.ProtocolError("媒体流不完整，保留分片等待续传", request=response.request)
         progress_callback(1.0)
 
     def _wait_for_retry(self, delay: float) -> None:

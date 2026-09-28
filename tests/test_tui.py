@@ -44,6 +44,73 @@ def test_queue_add_returns_stable_ids():
     assert [r.title for r in model.rows()] == ["A", "B"]
 
 
+def test_queue_recovery_preserves_options_and_directory(tmp_path):
+    model = DownloadQueueModel()
+    did = model.add(_item(), "/original/output")
+    model.set_progress(did, 0.42, "下载视频流", 1024, 20)
+    completed = model.add(_item("BV2"))
+    model.mark_done(completed, _outcome())
+    path = tmp_path / "tasks.json"
+    model.save(path)
+    recovered = DownloadQueueModel()
+    recovered.restore(path)
+    row = recovered.get(did)
+    assert (row.state, row.pct, row.output_dir) == ("paused", 42, "/original/output")
+    assert row.speed_bps == 0 and row.eta_seconds is None
+    assert row.item.selected_video_codec == 7
+    assert recovered.get(completed).state == "done"
+    assert recovered.add(_item()) > completed
+
+
+def test_active_task_cannot_be_deleted_and_pause_survives_progress():
+    model = DownloadQueueModel()
+    did = model.add(_item())
+    worker = MagicMock()
+    model.register_worker(did, worker)
+    model.delete(did)
+    assert model.get(did) is not None
+    model.cancel(did)
+    worker.cancel.assert_called_once()
+    model.set_progress(did, 0.5, "下载中")
+    assert model.get(did).state == "pausing"
+    model.mark_cancelled(did)
+    assert model.get(did).state == "paused"
+    assert not model.has_active
+
+
+def test_queue_cursor_actions_and_metrics_at_terminal_sizes(tmp_path):
+    from bilibili_downloader.tui.app import BiliFlowTUI
+    from bilibili_downloader.tui.widgets.download_queue import DownloadQueue
+
+    async def run():
+        for size in ((80, 24), (140, 44)):
+            p1, p2, p3 = _config_patches(tmp_path)
+            with p1, p2, p3:
+                app = BiliFlowTUI()
+                async with app.run_test(size=size) as pilot:
+                    did = app._model.add(_item())
+                    worker = MagicMock()
+                    app._model.register_worker(did, worker)
+                    app._model.set_progress(did, 0.4, "正在下载视频流", 2097152, 65)
+                    app._refresh_queue()
+                    app._show_workspace("tasks")
+                    table = app.query_one(DownloadQueue)
+                    await pilot.pause()
+                    table.move_cursor(row=table.get_row_index(str(did)))
+                    table.focus()
+                    await pilot.pause()
+                    assert table._cursor_download_id() == did
+                    assert table._metrics(app._model.get(did)) == ("2.0 MiB/s", "01:05")
+                    await pilot.press("c")
+                    await pilot.pause()
+                    worker.cancel.assert_called_once()
+                    assert app._model.get(did).state == "pausing"
+                    assert table.region.width <= size[0]
+                    app.save_screenshot(str(tmp_path / f"queue-{size[0]}.svg"))
+
+    asyncio.run(run())
+
+
 def test_queue_mark_done_partial_when_warnings():
     model = DownloadQueueModel()
     did = model.add(_item())
@@ -262,10 +329,8 @@ def test_progress_ticks_update_row_in_place_without_rebuild(tmp_path):
                 # Row count unchanged — no full-rebuild churn.
                 assert table.row_count == 1
                 row = table.get_row_at(0)
-                # 状态 cell (index 3) carries the latest status text.
-                assert "下载中" in row[3]
-                # 进度 cell (index 2) reflects ~80%, not the initial 0%.
-                assert "80" in row[2]
+                assert "下载中" in str(row[table._COL_STATUS])
+                assert "80" in row[table._COL_PROGRESS]
 
     asyncio.run(run())
 

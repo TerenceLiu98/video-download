@@ -1,9 +1,4 @@
-"""Left navigation sidebar — brand, nav buttons, login pill/action.
-
-Docked on the left of the main screen. The first nav ("首页") is the home
-view; the rest open modal screens. The login button shows the current login
-state (mirrors the Qt sidebar + header ghost button).
-"""
+"""Navigation for persistent workspaces and account/settings dialogs."""
 
 from __future__ import annotations
 
@@ -15,12 +10,11 @@ from textual.widgets import Button, Static
 class NavSidebar(Vertical):
     DEFAULT_CSS = """
     NavSidebar {
-        dock: left;
         width: 26;
+        height: 1fr;
         background: #0a0a0c;
         border-right: solid #26262b;
         padding: 1 1;
-        layer: base;
     }
     NavSidebar Static { background: transparent; }
     NavSidebar #brand-title { color: #ffffff; text-style: bold; }

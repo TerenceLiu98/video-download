@@ -55,6 +55,19 @@ def test_download_worker_emits_finished_on_success(tmp_path):
     assert finished.download_id == 5
 
 
+def test_paused_queued_worker_never_creates_download_service(tmp_path):
+    from bilibili_downloader.tui.workers.download import DownloadWorker
+
+    app = FakeApp()
+    worker = DownloadWorker(app, MagicMock(), _make_download_item(), str(tmp_path), 7)
+    worker.cancel()
+    with patch("bilibili_downloader.core.download_service.DownloadService") as service:
+        worker.run()
+    service.assert_not_called()
+    assert len(app.posted) == 1
+    assert isinstance(app.posted[0], messages.DownloadCancelled)
+
+
 def test_download_worker_emits_failed_on_error(tmp_path):
     from bilibili_downloader.tui.workers.download import DownloadWorker
 

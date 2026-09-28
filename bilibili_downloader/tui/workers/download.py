@@ -45,6 +45,9 @@ class DownloadWorker(CoreWorker):
         from bilibili_downloader.core.download_service import DownloadService
 
         try:
+            if self._cancel.is_set():
+                self.emit(messages.DownloadCancelled(self._download_id))
+                return
             os.makedirs(self._output_dir, exist_ok=True)
             self._service = DownloadService(
                 self._client, self._output_dir, ffmpeg_path=self._ffmpeg_path
@@ -96,4 +99,5 @@ class DownloadWorker(CoreWorker):
         self._last_pct = int_pct
         self._last_text = text
         self._last_emit_at = now
-        self.emit(messages.DownloadProgress(self._download_id, pct, text))
+        metrics = self._service.transfer_metrics if self._service is not None else (0.0, None)
+        self.emit(messages.DownloadProgress(self._download_id, pct, text, *metrics))

@@ -42,6 +42,10 @@ class DownloadService:
         )
         self._cancelled = False
 
+    @property
+    def transfer_metrics(self):
+        return self._downloader.speed_bps, self._downloader.eta_seconds
+
     def cancel(self) -> None:
         self._cancelled = True
         self._downloader.cancel()
