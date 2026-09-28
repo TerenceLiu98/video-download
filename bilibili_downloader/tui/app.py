@@ -642,10 +642,10 @@ class BiliFlowTUI(App):
         assert self.state is not None
         if message.request_id != self.state.login_request_id:
             return
-        nav = message.nav_info.get("data") or {}
+        nav = message.nav_info
         self.state.login.checking = False
         self.state.login.unknown = False
-        if message.nav_info.get("data", {}).get("isLogin") if "data" in message.nav_info else nav.get("isLogin"):
+        if nav.get("isLogin"):
             self.state.login.is_login = True
             self.state.login.uname = str(nav.get("uname", ""))
             self.state.login.mid = str(nav.get("mid", ""))
@@ -660,5 +660,4 @@ class BiliFlowTUI(App):
             return
         self.state.login.checking = False
         self.state.login.unknown = True
-        self._sidebar().set_login_label(self.state.login.label)
         self._sidebar().set_login_label(self.state.login.label)

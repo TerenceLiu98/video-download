@@ -122,6 +122,33 @@ def test_app_launches_and_mounts_three_regions(tmp_path):
     asyncio.run(run())
 
 
+def test_login_status_result_updates_sidebar_from_client_nav_shape(tmp_path):
+    """get_nav_info returns the inner data mapping, not an API envelope."""
+    from bilibili_downloader.tui import messages
+    from bilibili_downloader.tui.app import BiliFlowTUI
+
+    async def run():
+        p1, p2, p3 = _config_patches(tmp_path)
+        with p1, p2, p3:
+            app = BiliFlowTUI()
+            async with app.run_test(size=(110, 44)) as pilot:
+                await pilot.pause()
+                app.state.login_request_id = 1
+                app._on_login_status(
+                    messages.LoginStatusResult(
+                        1,
+                        {"isLogin": True, "uname": "扫码用户", "mid": 123456},
+                    )
+                )
+                assert app.state.login.is_login is True
+                assert app.state.login.label == "已登录：扫码用户 (123456)"
+                assert str(app._sidebar().query_one("#login-btn").label) == (
+                    "已登录：扫码用户 (123456)"
+                )
+
+    asyncio.run(run())
+
+
 def test_resolve_to_download_lifecycle(tmp_path):
     """Resolve → enqueue → download → queue shows 完成."""
     from bilibili_downloader.tui.app import BiliFlowTUI
