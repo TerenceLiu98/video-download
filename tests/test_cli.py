@@ -17,7 +17,6 @@ from bilibili_downloader.core.models import (
 )
 
 
-
 def test_cli_download_expands_all_pages_and_forwards_options(monkeypatch, tmp_path):
     info = VideoInfo(
         bvid="BV1GJ411x7h7",
@@ -171,4 +170,3 @@ def test_creator_batch_isolates_failures_and_exits_nonzero(monkeypatch, tmp_path
     # Two succeeded, one failed and is listed in the failure summary.
     assert "✗ BV000000000001" in out
     assert "1 个任务失败" in out
-

@@ -48,6 +48,30 @@ BiliFlow 支持单个视频或多 P 视频的 BV 号、AV 号、`bilibili.com/vi
 
 主题不使用单独开关，会跟随 Windows、macOS 或 Linux 桌面环境的日间/夜间设置实时切换。
 
+## TUI 工作流
+
+在支持交互式终端的环境中运行：
+
+```bash
+python -m bilibili_downloader tui
+```
+
+TUI 提供与桌面界面一致的核心流程，包括单个视频解析、批量导入、UP 主投稿索引、登录、下载设置、并发下载、取消、重试和文件选择。下载及 API 操作在后台 worker 中执行，日志写入各平台的 BiliFlow 日志目录，不会破坏全屏终端。
+
+常用快捷键：
+
+| 快捷键 | 操作 |
+|---|---|
+| `Ctrl+L` | 登录 |
+| `Ctrl+B` | 批量任务 |
+| `Ctrl+U` | UP 主投稿 |
+| `Ctrl+,` | 设置 |
+| `Ctrl+T` | 切换日间/夜间主题 |
+| `F1` | 帮助 |
+| `Ctrl+Q` | 退出 |
+
+处理 UP 主索引时，TUI 会把已经解析的 `VideoInfo` 写入索引旁的 `index.resolvecache.json`。再次处理同一索引时会优先使用缓存，以减少 API 请求和风控风险；缓存缺失或损坏时会自动回退到正常解析。
+
 ## CLI
 
 查看命令：
@@ -109,6 +133,14 @@ python -m bilibili_downloader creator 123456 \
 python -m bilibili_downloader download-index ./downloads/UP名称_123456/index.json --all
 ```
 
+如果已有旧版本生成的 `info.json`，可离线重建 TUI 使用的解析缓存：
+
+```bash
+python -m bilibili_downloader rebuild-cache ./downloads/UP名称_123456
+```
+
+命令会扫描 UP 主目录直属的 `[BVID] .../info.json`，把有效记录写入 `index.resolvecache.json`，并报告跳过或损坏的文件。目录中必须存在 `index.json`。
+
 GUI 抓取长索引时会在第 1 批后创建 `index.partial.json`，随后每 10 批原子更新一次。
 再次刷新同一 UID 会自动从该文件记录的 OID 游标继续；完整抓取成功后写入
 `index.json` 并移除检查点。索引位于设置中的“输出目录”，不在项目源码目录。
@@ -148,6 +180,7 @@ UP 主归档采用稳定 BVID/CID 路径。标题变化时会优先复用已存�
 ```text
 <UP名称>_<MID>/
   index.json
+  index.resolvecache.json
   [BVID] 视频标题/
     info.json
     comments.json

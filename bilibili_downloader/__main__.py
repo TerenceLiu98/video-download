@@ -68,7 +68,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="bilibili-downloader",
-        description="Bilibili video downloader — CLI and GUI modes.",
+        description="Bilibili video downloader - GUI, TUI, and CLI modes.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
