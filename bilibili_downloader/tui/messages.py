@@ -65,6 +65,12 @@ class BatchEvent(Message):
     def __init__(self):
         super().__init__()
         self.batch_id = 0
+        self.source_index = -1
+        self.part_index = 0
+
+
+class BatchItemResolving(BatchEvent):
+    pass
 
 
 class BatchItemReady(BatchEvent):

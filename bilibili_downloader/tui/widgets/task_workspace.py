@@ -35,7 +35,7 @@ class TaskWorkspace(Vertical):
         yield Static("", id="import-status", markup=False)
         with Horizontal(id="task-filters"):
             yield Select([
-                ("全部", "all"), ("下载中", "active"), ("等待中", "pending"),
+                ("全部", "all"), ("待解析/解析中", "resolving"), ("下载中", "active"), ("等待中", "pending"),
                 ("已暂停", "paused"), ("失败", "failed"), ("部分完成", "partial"),
                 ("已完成", "done"),
             ], value="all", allow_blank=False, id="task-filter")
@@ -91,7 +91,8 @@ class TaskWorkspace(Vertical):
         active = row is not None and self.model.get_worker(row.download_id) is not None
         self.query_one("#task-cancel", Button).disabled = not active or row.state == "pausing"
         self.query_one("#task-retry", Button).disabled = (
-            row is None or active or row.state not in ("paused", "cancelled", "failed") or row.item is None
+            row is None or active or row.state not in ("paused", "cancelled", "failed", "resolve_failed")
+            or (row.item is None and not row.source)
         )
         self.query_one("#task-delete", Button).disabled = row is None or active
         self.query_one("#task-open", Button).disabled = row is None or not (row.output_dir or row.video_path)
@@ -99,7 +100,7 @@ class TaskWorkspace(Vertical):
             self.query_one("#task-details", Static).update("")
             return
         speed, eta = table._metrics(row)
-        text = Text(row.item.video_info.title if row.item else row.title, style="bold")
+        text = Text(row.title, style="bold")
         text.append(f"\n{row.status} · {row.spec} · {speed} · 流 ETA {eta}", style="")
         if row.video_path or row.output_dir:
             text.append(f"\n保存位置：{row.video_path or row.output_dir}", style="")

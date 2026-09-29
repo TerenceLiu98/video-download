@@ -51,9 +51,11 @@ class BatchWorker(CoreWorker):
         self._creator_name = creator_name
         self._cache = cache
         self.batch_id = batch_id
+        self._source_index = -1
 
     def emit(self, message) -> None:
         message.batch_id = self.batch_id
+        message.source_index = self._source_index
         super().emit(message)
 
     def run(self) -> None:
@@ -66,6 +68,8 @@ class BatchWorker(CoreWorker):
         for index, url in enumerate(self._urls, start=1):
             if self._cancel.is_set():
                 break
+            self._source_index = index - 1
+            self.emit(messages.BatchItemResolving())
 
             # Check cache before resolving (bypass network if cached).
             info = None
@@ -81,7 +85,7 @@ class BatchWorker(CoreWorker):
 
             if info is not None:
                 pages = [info.for_page(p) for p in info.pages] if info.is_multi_part else [info]
-                for pi in pages:
+                for part_index, pi in enumerate(pages):
                     if self._cancel.is_set():
                         break
                     item = DownloadItem(
@@ -98,11 +102,13 @@ class BatchWorker(CoreWorker):
                         creator_mid=self._creator_mid,
                         creator_name=self._creator_name,
                     )
-                    self.emit(messages.BatchItemReady(item))
+                    message = messages.BatchItemReady(item)
+                    message.part_index = part_index
+                    self.emit(message)
+            self.emit(messages.BatchProgress(index, total))
             # Pace between items so we don't trip rate limits on long indexes.
             if index < total and not self._cancel.is_set():
                 self._cancellable_wait(random.uniform(*_INTER_RESOLVE_RANGE))
-            self.emit(messages.BatchProgress(index, total))
 
         # Persist cache if it was updated.
         if self._cache:

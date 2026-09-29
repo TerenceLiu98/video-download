@@ -50,6 +50,8 @@ class Row:
     speed_bps: float = 0.0
     eta_seconds: float | None = None
     video_path: str = ""
+    source: str = ""
+    resolve_options: dict = field(default_factory=dict)
 
 
 class DownloadQueueModel:
@@ -111,8 +113,10 @@ class DownloadQueueModel:
             record = dict(record)
             record["item"] = DownloadItem.model_validate(record["item"]) if record["item"] else None
             row = Row(**record)
-            if row.item:
+            if row.item and not row.title:
                 row.title = row.item.video_info.title
+            if row.state in ("awaiting", "resolving"):
+                row.state, row.status = "resolve_failed", "解析中断，可重试"
             row.speed_bps, row.eta_seconds = 0.0, None
             if row.state in ("pending", "downloading", "retry", "pausing"):
                 row.state, row.status = "paused", "已恢复，等待继续"
@@ -122,6 +126,32 @@ class DownloadQueueModel:
         self._next_id = max(self._order, default=-1) + 1
 
     # --- mutation ---
+    def add_source(self, source: str, title: str, output_dir: str, options: dict) -> int:
+        did = self.add(None, output_dir)
+        row = self._rows[did]
+        row.title = title or source
+        row.source = source
+        row.resolve_options = dict(options)
+        row.state, row.status = "awaiting", "待解析"
+        return did
+
+    def resolve_source(self, did: int, item, after: int | None = None) -> int:
+        if after is not None:
+            output_dir = self._rows[did].output_dir
+            did = self.add(item, output_dir)
+            self._order.remove(did)
+            self._order.insert(self._order.index(after) + 1, did)
+        row = self._rows[did]
+        row.item = item
+        row.title = item.video_info.title
+        if item.video_info.is_multi_part:
+            page = next((p for p in item.video_info.pages if p.cid == item.video_info.cid), None)
+            if page:
+                row.title += f" · P{page.page} {page.part}"
+        row.spec = _spec_label(item)
+        row.state, row.status, row.error = "pending", "等待下载", None
+        return did
+
     def add(self, item, output_dir: str = "") -> int:
         """Add a download item. Returns a stable download id."""
         download_id = self._next_id
@@ -313,18 +343,17 @@ class DownloadQueue(DataTable):
     def visible_rows(self) -> list[Row]:
         states = {
             "active": {"downloading", "pausing"}, "pending": {"pending", "retry"},
-            "paused": {"paused", "cancelled"}, "failed": {"failed", "error"},
+            "paused": {"paused", "cancelled"}, "failed": {"failed", "error", "resolve_failed"},
             "partial": {"partial"}, "done": {"done"},
+            "resolving": {"awaiting", "resolving"},
         }
-        priority = {"downloading": 0, "pausing": 0, "failed": 1, "error": 1,
-                    "partial": 2, "pending": 3, "retry": 3, "paused": 4, "cancelled": 4, "done": 5}
         rows = [r for r in self.model.rows()
                 if (self.filter_state == "all" or r.state in states.get(self.filter_state, set()))
-                and self.search.casefold() in (r.title + " " + (r.item.video_info.bvid if r.item else "")).casefold()]
-        return sorted(rows, key=lambda r: (priority.get(r.state, 6), r.download_id))
+                and self.search.casefold() in (r.title + " " + r.source + " " + (r.item.video_info.bvid if r.item else "")).casefold()]
+        return rows
 
     def _cells(self, row: Row):
-        color = {"failed": "red", "error": "red", "partial": "yellow",
+        color = {"failed": "red", "error": "red", "resolve_failed": "red", "partial": "yellow",
                  "done": "green", "downloading": "cyan"}.get(row.state, "white")
         status = Text(row.status, style=color, no_wrap=True, overflow="ellipsis")
         title = Text(row.title, no_wrap=True, overflow="ellipsis")

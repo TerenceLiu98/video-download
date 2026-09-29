@@ -38,7 +38,7 @@ def test_task_filters_details_and_cleanup(tmp_path, monkeypatch):
             table = app.query_one(DownloadQueue)
             assert not app.query_one(MainScreen).display
             assert app.query_one(TaskWorkspace).display
-            assert table._visible_ids == [active, partial, complete]
+            assert table._visible_ids == [complete, partial, active]
             assert table.region.height > 20
             assert app.query_one(TaskWorkspace).region.x >= app.query_one("NavSidebar").region.right
             app.query_one("#task-filter", Select).value = "partial"
@@ -68,6 +68,93 @@ def test_task_filters_details_and_cleanup(tmp_path, monkeypatch):
             assert table.region.height >= 3
             assert table.virtual_size.width <= table.size.width
             app.save_screenshot(str(tmp_path / "task-workspace-narrow.svg"))
+
+    asyncio.run(run())
+
+
+def test_index_rows_appear_before_resolution_and_stay_in_order(tmp_path, monkeypatch):
+    from bilibili_downloader.core.models import (
+        CreatorVideoEntry,
+        CreatorVideoIndex,
+        VideoPage,
+    )
+    from bilibili_downloader.tui.widgets.download_queue import DownloadQueueModel
+
+    monkeypatch.setattr("bilibili_downloader.utils.config.DEFAULT_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr("bilibili_downloader.utils.config._load_sessdata_from_keyring", lambda: "")
+    monkeypatch.setattr("bilibili_downloader.tui.workers.batch.BatchWorker._cancellable_wait", lambda *_: None)
+    release = threading.Event()
+    sources = ["BVfirst", "BVsecond", "BVthird"]
+    index = CreatorVideoIndex(mid=123, name="UP", source="test", fetched_at="today", total=3,
+                              videos=[CreatorVideoEntry(bvid=s, title=f"标题 {s}") for s in sources])
+
+    def resolve(source):
+        assert release.wait(5)
+        if source == "BVthird":
+            raise ValueError("视频已删除")
+        return VideoInfo(bvid=source, cid=1, title=f"标题 {source}", pages=(
+            [VideoPage(cid=1, page=1, part="上"), VideoPage(cid=2, page=2, part="下")]
+            if source == "BVfirst" else []
+        ))
+
+    async def run():
+        with patch("bilibili_downloader.core.batch.BatchResolver.resolve_one", side_effect=resolve):
+            app = BiliFlowTUI()
+            async with app.run_test(size=(140, 44)) as pilot:
+                try:
+                    app.state.settings.output_dir = str(tmp_path)
+                    with patch.object(app, "_launch_download") as launch:
+                        app._start_batch(sources, creator_index=index)
+                        await pilot.pause()
+                        rows = app._model.rows()
+                        original_ids = [r.download_id for r in rows]
+                        assert len(rows) == 3
+                        assert [r.title for r in rows] == [f"标题 {s}" for s in sources]
+                        assert all(r.item is None for r in rows)
+                        assert rows[1].state == "awaiting"
+                        launch.assert_not_called()
+                        release.set()
+                        for _ in range(40):
+                            await pilot.pause(0.05)
+                            if not app._batch_jobs[1].running:
+                                break
+                        assert not app._batch_jobs[1].running
+                        rows = app._model.rows()
+                        assert len(rows) == 4
+                        assert [r.download_id for r in rows][::2] == original_ids[:2]
+                        assert rows[-1].download_id == original_ids[-1]
+                        assert rows[-1].state == "resolve_failed"
+                        assert "视频已删除" in rows[-1].error
+                        assert [r.item.video_info.cid for r in rows[:2]] == [1, 2]
+                        assert launch.call_count == 3
+                        order = [r.download_id for r in rows]
+                        app._model.mark_done(order[0], DownloadOutcome(video_path="/tmp/a.mp4"))
+                        app._model.mark_done(order[1], DownloadOutcome(video_path="/tmp/b.mp4", warnings=["无字幕"]))
+                        app._refresh_queue()
+                        table = app.query_one(DownloadQueue)
+                        assert table._visible_ids == order
+                        assert app._batch_jobs[1].done == 3
+                        summary = str(app.query_one("#task-summary", Static).render())
+                        assert "完成 1/3" in summary and "部分完成 1" in summary
+                        imports = str(app.query_one("#import-status", Static).render())
+                        assert "解析 3/3" in imports and "失败 1" in imports
+                        restored = DownloadQueueModel()
+                        restored.restore(app._task_path)
+                        assert [r.download_id for r in restored.rows()] == order
+                        assert restored.rows()[-1].source == "BVthird"
+                        app.save_screenshot(str(tmp_path / "index-progress.svg"))
+                        with patch("bilibili_downloader.core.batch.BatchResolver.resolve_one",
+                                   return_value=VideoInfo(bvid="BVthird", cid=3, title="重试成功")):
+                            app._retry_download(order[-1])
+                            for _ in range(40):
+                                await pilot.pause(0.05)
+                                if not app._batch_jobs[2].running:
+                                    break
+                            assert app._model.get(order[-1]).item.video_info.cid == 3
+                            assert table._visible_ids == order
+                            assert launch.call_count == 4
+                finally:
+                    release.set()
 
     asyncio.run(run())
 

@@ -202,7 +202,15 @@ class BiliFlowTUI(App):
         flags["embed_cover"] = self.state.settings.embed_cover
         n = len(urls)
         batch_id = max(self._batch_jobs, default=0) + 1
-        self._batch_jobs[batch_id] = BatchJob(batch_id, n, self.state.settings.output_dir)
+        job = BatchJob(batch_id, n, self.state.settings.output_dir)
+        self._batch_jobs[batch_id] = job
+        titles = {v.bvid: v.title for v in creator_index.videos} if creator_index else {}
+        options = dict(flags=flags, quality=quality, codec=codec,
+                       creator_mid=creator_index.mid if creator_index else 0,
+                       creator_name=creator_index.name if creator_index else "")
+        job.row_ids = [self._model.add_source(url, titles.get(url, url), job.output_dir, options)
+                       for url in urls]
+        self._refresh_queue()
         self._show_workspace("tasks")
         self._refresh_task_summary()
         self.notify(f"已提交 {n} 个链接，正在后台解析")
@@ -242,12 +250,42 @@ class BiliFlowTUI(App):
         if self._quitting:
             return
         job = self._batch_jobs.get(message.batch_id)
-        self.enqueue_download(message.item, job.output_dir if job else None)
+        if job and 0 <= message.source_index < len(job.row_ids):
+            did = job.row_ids[message.source_index]
+            if self._model.get(did) is None:
+                return
+            parts = job.part_rows.setdefault(message.source_index, [])
+            if message.part_index < len(parts):
+                return
+            after = next((p for p in reversed(parts) if self._model.get(p)), did) if parts else None
+            did = self._model.resolve_source(did, message.item, after=after)
+            parts.append(did)
+            self._launch_download(did, message.item)
+            self._refresh_queue()
+        else:
+            self.enqueue_download(message.item, job.output_dir if job else None)
+
+    def _batch_source_row(self, message):
+        job = self._batch_jobs.get(message.batch_id)
+        if job and 0 <= message.source_index < len(job.row_ids):
+            return self._model.get(job.row_ids[message.source_index])
+        return None
+
+    @on(messages.BatchItemResolving)
+    def _on_batch_item_resolving(self, message: messages.BatchItemResolving) -> None:
+        row = self._batch_source_row(message)
+        if row:
+            row.state, row.status = "resolving", "解析中"
+            self._refresh_queue()
 
     @on(messages.BatchItemFailed)
     def _on_batch_item_failed(self, message: messages.BatchItemFailed) -> None:
         assert self.state is not None
-        self.state.queue.add_error(message.error)
+        row = self._batch_source_row(message)
+        if row:
+            row.state, row.status, row.error = "resolve_failed", "解析失败", message.error
+        elif message.batch_id not in self._batch_jobs:
+            self.state.queue.add_error(message.error)
         job = self._batch_jobs.get(message.batch_id)
         if job:
             job.failed += 1
@@ -267,7 +305,10 @@ class BiliFlowTUI(App):
         job = self._batch_jobs.get(message.batch_id)
         if job:
             job.status = f"风控重试 {message.attempt} · 等待 {message.delay:g}s"
-        self._refresh_task_summary()
+        row = self._batch_source_row(message)
+        if row:
+            row.status = f"解析重试 · 等待 {message.delay:g}s"
+        self._refresh_queue()
 
     @on(messages.BatchDone)
     def _on_batch_done_msg(self, message: messages.BatchDone) -> None:
@@ -276,7 +317,12 @@ class BiliFlowTUI(App):
             job.running = False
             job.worker = None
             job.status = f"中断：{message.error}" if message.error else "解析完成"
-        self._refresh_task_summary()
+            for did in job.row_ids:
+                row = self._model.get(did)
+                if row and row.state in ("awaiting", "resolving"):
+                    row.state, row.status = "resolve_failed", "解析中断，可重试"
+                    row.error = message.error or "解析未完成"
+        self._refresh_queue()
         if message.error:
             self.notify(f"批量导入中断：{message.error}", severity="error")
         elif job:
@@ -595,15 +641,17 @@ class BiliFlowTUI(App):
         rows = self._model.rows()
         counts = Counter(r.state for r in rows)
         speed = sum(r.speed_bps for r in rows if r.state == "downloading")
-        summary = (f"下载任务 {len(rows)} · 下载中 {counts['downloading']} · "
+        download_total = sum(r.item is not None for r in rows)
+        summary = (f"解析：待解析 {counts['awaiting']} · 解析中 {counts['resolving']} · 失败 {counts['resolve_failed']}\n"
+                   f"下载：完成 {counts['done']}/{download_total} 分P · 部分完成 {counts['partial']} · 下载中 {counts['downloading']} · "
                    f"等待 {counts['pending'] + counts['retry']} · "
                    f"异常 {counts['failed'] + counts['error'] + counts['partial']} · "
-                   f"完成 {counts['done']} · {speed / 1048576:.1f} MiB/s")
+                   f"{speed / 1048576:.1f} MiB/s")
         jobs = list(self._batch_jobs.values())
         running = [j for j in jobs if j.running]
         shown = running or jobs[-1:]
         imports = "\n".join(
-            f"导入 #{j.batch_id} · {j.done}/{j.total} · 失败 {j.failed} · {j.status}"
+            f"导入 #{j.batch_id}：{j.total} 条 · 解析 {j.done}/{j.total} · 失败 {j.failed} · {j.status}"
             for j in shown
         )
         self.query_one(TaskWorkspace).update_summary(summary, imports)
@@ -675,6 +723,14 @@ class BiliFlowTUI(App):
     def _retry_download(self, download_id: int) -> None:
         assert self.state is not None
         row = self.state.queue.get(download_id)
+        if row and row.state == "resolve_failed" and row.source:
+            batch_id = max(self._batch_jobs, default=0) + 1
+            job = BatchJob(batch_id, 1, row.output_dir, row_ids=[download_id])
+            self._batch_jobs[batch_id] = job
+            row.state, row.status, row.error = "awaiting", "待解析", None
+            self._refresh_queue()
+            self.start_batch([row.source], batch_id=batch_id, **row.resolve_options)
+            return
         if row is None or row.state not in ("failed", "paused", "cancelled"):
             return
         if self.state.queue.get_worker(download_id) is not None:

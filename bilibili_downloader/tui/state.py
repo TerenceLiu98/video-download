@@ -50,6 +50,8 @@ class BatchJob:
     running: bool = True
     status: str = "解析中"
     worker: Optional[object] = None
+    row_ids: list[int] = field(default_factory=list)
+    part_rows: dict[int, list[int]] = field(default_factory=dict)
 
 
 @dataclass
