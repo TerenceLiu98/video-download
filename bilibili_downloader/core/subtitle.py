@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import httpx
 
 from bilibili_downloader.api.endpoints import USER_AGENT
+from bilibili_downloader.utils.cancellation import attach_current_request
 from bilibili_downloader.utils.network import BILIBILI_RESOURCE_HOSTS, trusted_https_url
 
 MAX_SUBTITLE_BYTES = 10 * 1024 * 1024
@@ -24,7 +25,8 @@ class SubtitleDownloader:
             "User-Agent": USER_AGENT,
             "Referer": "https://www.bilibili.com/",
         }
-        with httpx.Client(headers=headers, timeout=30.0, follow_redirects=False) as client:
+        with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0, connect=5.0),
+                          event_hooks={"request": [attach_current_request]}, follow_redirects=False) as client:
             current_url = subtitle_url
             for _ in range(8):
                 with client.stream("GET", current_url) as resp:

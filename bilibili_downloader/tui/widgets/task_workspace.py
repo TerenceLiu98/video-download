@@ -95,7 +95,9 @@ class TaskWorkspace(Vertical):
             "暂无任务" if not len(self.model) else "没有匹配的任务"
         )
         active = row is not None and self.model.get_worker(row.download_id) is not None
-        self.query_one("#task-cancel", Button).disabled = not active or row.state == "pausing"
+        self.query_one("#task-cancel", Button).disabled = (
+            row is None or row.state == "pausing" or (not active and row.state not in ("pending", "retry"))
+        )
         self.query_one("#task-retry", Button).disabled = (
             row is None or active or row.state not in ("paused", "cancelled", "failed", "resolve_failed")
             or (row.item is None and not row.source)

@@ -21,6 +21,7 @@ from bilibili_downloader.core.danmaku import DanmakuDownloader
 from bilibili_downloader.core.downloader import StreamDownloader
 from bilibili_downloader.core.models import DownloadItem, DownloadOutcome, SubtitleInfo
 from bilibili_downloader.core.subtitle import SubtitleDownloader
+from bilibili_downloader.utils.cancellation import RequestCancellation
 
 logger = logging.getLogger(__name__)
 _SIDECAR_LOCK = threading.Lock()
@@ -41,6 +42,7 @@ class DownloadService:
             api_client, output_dir, ffmpeg_path=ffmpeg_path
         )
         self._cancelled = False
+        self._requests = RequestCancellation()
 
     @property
     def transfer_metrics(self):
@@ -48,9 +50,18 @@ class DownloadService:
 
     def cancel(self) -> None:
         self._cancelled = True
+        self._requests.cancel()
         self._downloader.cancel()
 
     def download(
+        self,
+        item: DownloadItem,
+        progress_callback: Callable[[float, str], None],
+    ) -> DownloadOutcome:
+        with self._requests.bind():
+            return self._download(item, progress_callback)
+
+    def _download(
         self,
         item: DownloadItem,
         progress_callback: Callable[[float, str], None],

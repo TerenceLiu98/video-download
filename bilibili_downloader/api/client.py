@@ -19,6 +19,7 @@ from bilibili_downloader.core.models import (
     VideoPage,
     VideoQuality,
 )
+from bilibili_downloader.utils.cancellation import RequestCancellation
 from bilibili_downloader.utils.network import BILIBILI_RESOURCE_HOSTS, trusted_https_url
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class BilibiliAPIClient:
         api_interval_range: tuple[float, float] = (1.0, 3.0),
         risk_retry_delays: tuple[float, ...] = (15.0, 45.0, 120.0),
     ):
+        self._requests = RequestCancellation()
         self._client = httpx.Client(
             base_url=ep.BASE_URL,
             headers={
@@ -50,7 +52,8 @@ class BilibiliAPIClient:
                 "Referer": "https://www.bilibili.com/",
             },
             cookies={"SESSDATA": sessdata} if sessdata else {},
-            timeout=30.0,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            event_hooks={"request": [self._requests.attach]},
             http2=True,
         )
         self._wbi_signer = WBISigner()
@@ -157,6 +160,8 @@ class BilibiliAPIClient:
 
     def _wait_for_api_slot(self) -> None:
         while True:
+            if self._requests.cancelled.is_set():
+                raise RuntimeError("Request cancelled")
             delay = self._next_api_request_at - time.monotonic()
             if delay <= 0:
                 return
@@ -456,6 +461,9 @@ class BilibiliAPIClient:
             )
             for p in data
         ]
+
+    def cancel_pending_requests(self):
+        self._requests.cancel()
 
     def close(self):
         """Close the underlying HTTP client."""

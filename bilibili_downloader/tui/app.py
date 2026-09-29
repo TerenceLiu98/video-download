@@ -5,16 +5,15 @@ sidebar, the persistent download queue, and all background-worker launchers.
 Every blocking core call runs in a thread via ``@work(thread=True)`` and reports
 back via Textual Messages (see ``tui/messages.py``).
 
-Concurrency mirrors the Qt GUI's ``QThreadPool.maxThreadCount``: a
-``threading.Semaphore`` sized to ``settings.max_concurrent_downloads`` caps
-in-flight downloads. Each task gets its own ``DownloadService`` (mutable
+Only tasks with a free concurrency slot are submitted to the thread pool.
+Each task gets its own ``DownloadService`` (mutable
 per-download state) but shares the httpx client + module ``_SIDECAR_LOCK``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from textual import on, work
@@ -102,7 +101,6 @@ class BiliFlowTUI(App):
         settings = config.load()
         client = BilibiliAPIClient(sessdata=settings.sessdata or None)
         self.state = AppState(config=config, settings=settings, api_client=client, queue=self._model)
-        self._semaphore = threading.Semaphore(max(1, settings.max_concurrent_downloads))
         self._task_path = config.task_path
         try:
             self._model.restore(self._task_path)
@@ -122,7 +120,8 @@ class BiliFlowTUI(App):
     def __init__(self):
         super().__init__()
         self.state: AppState | None = None
-        self._semaphore: threading.Semaphore | None = None
+        self._pending_downloads = {}
+        self._active_downloads = set()
         self._model = DownloadQueueModel()
         self._creator_worker = None
         self._task_path = None
@@ -443,10 +442,8 @@ class BiliFlowTUI(App):
         except OSError as exc:
             self.notify(f"设置保存失败：{exc}", severity="error")
             return
-        old_max = self.state.settings.max_concurrent_downloads
         self.state.settings = new_settings
-        if new_settings.max_concurrent_downloads != old_max:
-            self._semaphore = threading.Semaphore(max(1, new_settings.max_concurrent_downloads))
+        self._drain_downloads()
         self._control_panel().sync_defaults_from_settings(new_settings)
         self.notify("设置已保存")
 
@@ -561,38 +558,44 @@ class BiliFlowTUI(App):
 
     def enqueue_download(self, item, output_dir: str | None = None) -> None:
         assert self.state is not None
+        if self._quitting:
+            return
         download_id = self.state.queue.add(item, output_dir or self.state.settings.output_dir)
         self._refresh_queue()
         self._launch_download(download_id, item)
         self._refresh_task_summary()
 
     def _launch_download(self, download_id: int, item) -> None:
-        assert self.state is not None and self._semaphore is not None
-        worker = DownloadWorker(
-            self,
-            self.state.api_client,
-            item,
-            self.state.queue.get(download_id).output_dir or self.state.settings.output_dir,
-            download_id,
-            self.state.settings.ffmpeg_path or None,
-        )
-        self.state.queue.register_worker(download_id, worker)
-        self.run_download_worker(worker, self._semaphore)
+        if self._quitting or download_id in self._active_downloads:
+            return
+        self._pending_downloads[download_id] = item
+        self._drain_downloads()
+
+    def _drain_downloads(self) -> None:
+        assert self.state is not None
+        while (not self._quitting and self._pending_downloads
+               and len(self._active_downloads) < self.state.settings.max_concurrent_downloads):
+            did = next(iter(self._pending_downloads))
+            item = self._pending_downloads.pop(did)
+            row = self._model.get(did)
+            if row is None or row.state not in ("pending", "retry"):
+                continue
+            worker = DownloadWorker(self, self.state.api_client, item,
+                                    row.output_dir or self.state.settings.output_dir,
+                                    did, self.state.settings.ffmpeg_path or None)
+            self._model.register_worker(did, worker)
+            self._active_downloads.add(did)
+            self.run_download_worker(worker)
 
     @work(thread=True, group="download")
-    def run_download_worker(self, worker, semaphore) -> None:
-        while not semaphore.acquire(timeout=0.1):
-            if worker.cancel_checker():
-                worker.run()
-                return
-        try:
-            worker.run()
-        finally:
-            semaphore.release()
+    def run_download_worker(self, worker) -> None:
+        worker.run()
 
     @on(messages.DownloadProgress)
     def _on_download_progress(self, message: messages.DownloadProgress) -> None:
         assert self.state is not None
+        if self._quitting:
+            return
         self._queue_dirty = True
         self.state.queue.set_progress(message.download_id, message.pct, message.status_text,
                                       message.speed_bps, message.eta_seconds)
@@ -612,7 +615,11 @@ class BiliFlowTUI(App):
     def _on_download_finished(self, message: messages.DownloadFinished) -> None:
         assert self.state is not None
         self.state.queue.mark_done(message.download_id, message.outcome)
+        self._active_downloads.discard(message.download_id)
+        self._drain_downloads()
         self._refresh_queue()
+        if self._quitting:
+            return
         warnings = getattr(message.outcome, "warnings", []) or []
         if warnings:
             self.notify(f"下载完成，但有 {len(warnings)} 项警告", severity="warning")
@@ -623,17 +630,25 @@ class BiliFlowTUI(App):
     def _on_download_failed(self, message: messages.DownloadFailed) -> None:
         assert self.state is not None
         self.state.queue.mark_failed(message.download_id, message.error)
+        self._active_downloads.discard(message.download_id)
+        self._drain_downloads()
         self._refresh_queue()
+        if self._quitting:
+            return
         self.notify(f"下载失败：{message.error}", severity="error")
 
     @on(messages.DownloadCancelled)
     def _on_download_cancelled(self, message: messages.DownloadCancelled) -> None:
         assert self.state is not None
         self.state.queue.mark_cancelled(message.download_id)
+        self._active_downloads.discard(message.download_id)
+        self._drain_downloads()
         self._refresh_queue()
 
     def _refresh_queue(self) -> None:
         self._queue_dirty = True
+        if self._quitting:
+            return
         try:
             self.query_one(DownloadQueue).refresh_model()
             self._refresh_task_summary()
@@ -641,6 +656,8 @@ class BiliFlowTUI(App):
             pass
 
     def _refresh_task_summary(self) -> None:
+        if self._quitting:
+            return
         from collections import Counter
 
         rows = self._model.rows()
@@ -668,6 +685,8 @@ class BiliFlowTUI(App):
     def _save_queue(self) -> None:
         from bilibili_downloader.core.creator import atomic_write_json
 
+        if self._quitting:
+            return
         if self._save_future is not None:
             if not self._save_future.done():
                 return
@@ -682,24 +701,29 @@ class BiliFlowTUI(App):
             self._queue_dirty = False
             self._save_future = self._save_executor.submit(atomic_write_json, self._task_path, snapshot)
 
-    def on_unmount(self) -> None:
-        self._save_executor.shutdown(wait=True)
+    async def on_unmount(self) -> None:
         if self._save_future is not None:
             try:
-                self._save_future.result()
+                await asyncio.wrap_future(self._save_future)
             except OSError:
                 self._queue_dirty = True
                 logger.exception("Task checkpoint failed; retrying latest snapshot on exit")
         if self._task_path is not None and self._queue_dirty:
             try:
-                self._model.save(self._task_path)
+                from bilibili_downloader.core.creator import atomic_write_json
+
+                await asyncio.wrap_future(self._save_executor.submit(
+                    atomic_write_json, self._task_path, self._model.snapshot()))
             except OSError:
                 logger.exception("Unable to save final task snapshot")
+        self._save_executor.shutdown(wait=False)
 
     # --- queue key actions (cancel / retry / delete) ---
     @on(DownloadQueue.QueueAction)
     def _on_queue_action(self, message: DownloadQueue.QueueAction) -> None:
         assert self.state is not None
+        if self._quitting:
+            return
         action = message.action
         did = message.download_id
         if action == "cancel_all":
@@ -722,6 +746,7 @@ class BiliFlowTUI(App):
                 self.notify("请先暂停任务再删除", severity="warning")
                 return
             self.state.queue.delete(did)
+            self._pending_downloads.pop(did, None)
         elif action == "retry":
             self._retry_download(did)
         self._refresh_queue()
@@ -774,6 +799,8 @@ class BiliFlowTUI(App):
     # --- quit confirmation (parity with MainWindow.closeEvent) ---
     def action_quit(self) -> None:
         assert self.state is not None
+        if self._quitting:
+            return
         if self.state.queue.has_active or any(j.running for j in self._batch_jobs.values()):
             self.push_screen(
                 ConfirmScreen("仍有导入或下载正在运行。退出将停止未完成的解析，保留已入队任务和下载断点，确认退出吗？"),
@@ -788,16 +815,51 @@ class BiliFlowTUI(App):
 
     def _do_quit(self) -> None:
         assert self.state is not None
+        if self._quitting:
+            return
+        from bilibili_downloader.tui.screens.shutdown_screen import ShutdownScreen
+
         self._quitting = True
+        self.push_screen(ShutdownScreen())
         for job in self._batch_jobs.values():
             if job.worker is not None:
                 job.worker.cancel()
         self.state.queue.cancel_all()
-        self._save_queue()
+        self._pending_downloads.clear()
+        if self._creator_worker is not None:
+            self._creator_worker.cancel()
+        self.state.api_client.cancel_pending_requests()
+
+    @work(group="shutdown", exclusive=True)
+    async def _finish_shutdown(self) -> None:
+        from bilibili_downloader.core.creator import atomic_write_json
+        from bilibili_downloader.tui.screens.shutdown_screen import ShutdownScreen
+
+        screen = self.screen
+        if not isinstance(screen, ShutdownScreen):
+            return
+        while (self._active_downloads or any(j.running for j in self._batch_jobs.values())
+               or any(w.is_running or w.is_pending for w in self.workers if w.group != "shutdown")):
+            screen.set_status("正在停止后台任务，保留下载分片…")
+            await asyncio.sleep(0.05)
+        # Let the last worker's terminal messages update the queue before saving.
+        await asyncio.sleep(0)
+        screen.set_status("正在保存任务记录…")
+        if self._save_future is not None:
+            try:
+                await asyncio.wrap_future(self._save_future)
+            except OSError:
+                logger.exception("Previous checkpoint failed; saving final state")
+            self._save_future = None
         try:
-            self.state.api_client.close()
-        except Exception:  # noqa: BLE001
-            logger.debug("failed to close api client on quit", exc_info=True)
+            if self._task_path is not None:
+                await asyncio.wrap_future(self._save_executor.submit(
+                    atomic_write_json, self._task_path, self._model.snapshot()))
+                self._queue_dirty = False
+        except OSError as exc:
+            screen.set_status(f"保存失败：{exc}", retry=True)
+            return
+        await asyncio.to_thread(self.state.api_client.close)
         self.exit()
 
     # --- login ---

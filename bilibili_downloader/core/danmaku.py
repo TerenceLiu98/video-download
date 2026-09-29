@@ -52,13 +52,16 @@ class DanmakuDownloader:
     @staticmethod
     def download_xml(cid: int) -> bytes:
         """Download danmaku in XML format from Bilibili."""
+        from bilibili_downloader.utils.cancellation import attach_current_request
+
         url = ep.DANMAKU_XML_URL.format(cid=cid)
         headers = {
             "User-Agent": USER_AGENT,
             "Referer": "https://www.bilibili.com/",
         }
         chunks = bytearray()
-        with httpx.stream("GET", url, headers=headers, timeout=30.0) as resp:
+        with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0, connect=5.0),
+                          event_hooks={"request": [attach_current_request]}) as client, client.stream("GET", url) as resp:
             resp.raise_for_status()
             for chunk in resp.iter_bytes():
                 chunks.extend(chunk)

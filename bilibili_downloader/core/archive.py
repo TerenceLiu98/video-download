@@ -260,12 +260,15 @@ def _root_comments(data: dict) -> list[dict]:
 
 def download_cover(url: str, output_path: Path) -> None:
     """Download a trusted Bilibili cover and normalize it to JPEG atomically."""
+    from bilibili_downloader.utils.cancellation import attach_current_request
+
     current_url = trusted_media_url(url, BILIBILI_RESOURCE_HOSTS)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     content = bytearray()
     with httpx.Client(
         headers={"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"},
-        timeout=30.0,
+        timeout=httpx.Timeout(30.0, connect=5.0),
+        event_hooks={"request": [attach_current_request]},
         follow_redirects=False,
     ) as client:
         for _ in range(8):

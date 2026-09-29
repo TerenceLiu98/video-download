@@ -285,7 +285,7 @@ def test_concurrency_semaphore_caps_inflight(tmp_path):
             app = BiliFlowTUI()
             async with app.run_test(size=(110, 44)) as pilot:
                 await pilot.pause()
-                app._semaphore = threading.Semaphore(2)
+                app.state.settings.max_concurrent_downloads = 2
                 for i in range(5):
                     app.enqueue_download(_item(f"BV{i}", f"v{i}"))
                 await pilot.pause(delay=1.0)

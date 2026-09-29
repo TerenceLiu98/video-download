@@ -18,6 +18,7 @@ from bilibili_downloader.api.endpoints import USER_AGENT
 from bilibili_downloader.core.archive import ArtifactPaths
 from bilibili_downloader.core.ffmpeg import FFmpegManager
 from bilibili_downloader.core.models import DownloadItem, StreamInfo, VideoQuality
+from bilibili_downloader.utils.cancellation import RequestCancellation
 from bilibili_downloader.utils.network import (
     BILIBILI_RESOURCE_HOSTS,
     trusted_media_url,
@@ -58,6 +59,7 @@ class StreamDownloader:
         self._max_retries = max(1, max_retries)
         self._ffmpeg_path = ffmpeg_path
         self._cancelled = False
+        self._requests = RequestCancellation()
         self.speed_bps = 0.0
         self.eta_seconds = None
         self.last_video_stream: Optional[StreamInfo] = None
@@ -68,6 +70,7 @@ class StreamDownloader:
     def cancel(self):
         """Signal the downloader to cancel current operation."""
         self._cancelled = True
+        self._requests.cancel()
 
     def download(
         self,
@@ -282,7 +285,7 @@ class StreamDownloader:
             retries=1,
             verify=SSL_CONTEXT,
         )
-        with httpx.Client(transport=transport) as client:
+        with httpx.Client(transport=transport, event_hooks={"request": [self._requests.attach]}) as client:
             for attempt in range(self._max_retries):
                 if self._cancelled:
                     raise RuntimeError("Download cancelled")
@@ -309,6 +312,8 @@ class StreamDownloader:
                         OSError,
                         ValueError,
                     ) as e:
+                        if self._cancelled:
+                            raise RuntimeError("Download cancelled") from e
                         last_error = e
                         logger.debug(
                             "Download attempt %d failed for %s: %s",
@@ -342,7 +347,7 @@ class StreamDownloader:
                 "GET",
                 current_url,
                 headers=headers,
-                timeout=120.0,
+                timeout=httpx.Timeout(120.0, connect=5.0),
                 follow_redirects=False,
             ) as response:
                 if response.is_redirect:

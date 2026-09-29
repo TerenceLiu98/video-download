@@ -281,6 +281,8 @@ class DownloadQueueModel:
         if worker is not None:
             self.mark_cancel_in_flight(download_id)
             worker.cancel()
+        elif (row := self.get(download_id)) is not None and row.state in ("pending", "retry"):
+            self.mark_cancelled(download_id)
 
     def delete(self, download_id: int) -> None:
         if download_id in self._workers:
@@ -292,8 +294,8 @@ class DownloadQueueModel:
             self._order.remove(download_id)
 
     def cancel_all(self) -> None:
-        for did in list(self._workers):
-            self.cancel(did)
+        for row in self.rows():
+            self.cancel(row.download_id)
 
 
 def _spec_label(item) -> str:
