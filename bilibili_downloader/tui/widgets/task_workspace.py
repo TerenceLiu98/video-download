@@ -29,6 +29,7 @@ class TaskWorkspace(Vertical):
     def __init__(self, model):
         super().__init__(id="task-workspace")
         self.model = model
+        self._search_timer = None
 
     def compose(self) -> ComposeResult:
         yield Static("下载任务", id="task-summary", markup=False)
@@ -60,8 +61,13 @@ class TaskWorkspace(Vertical):
 
     @on(Input.Changed, "#task-search")
     def search_changed(self, event: Input.Changed) -> None:
+        if self._search_timer is not None:
+            self._search_timer.stop()
+        self._search_timer = self.set_timer(0.15, self._apply_search)
+
+    def _apply_search(self) -> None:
         table = self.query_one(DownloadQueue)
-        table.search = event.value.strip()
+        table.search = self.query_one("#task-search", Input).value.strip()
         table.refresh_model()
         self.update_details()
 

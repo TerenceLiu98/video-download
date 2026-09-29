@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -127,6 +128,9 @@ class BiliFlowTUI(App):
         self._task_path = None
         self._batch_jobs: dict[int, BatchJob] = {}
         self._quitting = False
+        self._queue_dirty = False
+        self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="task-save")
+        self._save_future = None
 
     # --- helpers to reach widgets ---
     def _sidebar(self) -> NavSidebar:
@@ -589,6 +593,7 @@ class BiliFlowTUI(App):
     @on(messages.DownloadProgress)
     def _on_download_progress(self, message: messages.DownloadProgress) -> None:
         assert self.state is not None
+        self._queue_dirty = True
         self.state.queue.set_progress(message.download_id, message.pct, message.status_text,
                                       message.speed_bps, message.eta_seconds)
         # Per-tick progress repaints only the changed row; structural events
@@ -628,7 +633,7 @@ class BiliFlowTUI(App):
         self._refresh_queue()
 
     def _refresh_queue(self) -> None:
-        self._save_queue()
+        self._queue_dirty = True
         try:
             self.query_one(DownloadQueue).refresh_model()
             self._refresh_task_summary()
@@ -661,12 +666,35 @@ class BiliFlowTUI(App):
         )
 
     def _save_queue(self) -> None:
-        if self._task_path is not None:
+        from bilibili_downloader.core.creator import atomic_write_json
+
+        if self._save_future is not None:
+            if not self._save_future.done():
+                return
             try:
-                self._model.save(self._task_path)
+                self._save_future.result()
             except OSError as exc:
                 self.notify(f"任务记录保存失败：{exc}", severity="error")
                 self._task_path = None
+            self._save_future = None
+        if self._task_path is not None and self._queue_dirty:
+            snapshot = self._model.snapshot()
+            self._queue_dirty = False
+            self._save_future = self._save_executor.submit(atomic_write_json, self._task_path, snapshot)
+
+    def on_unmount(self) -> None:
+        self._save_executor.shutdown(wait=True)
+        if self._save_future is not None:
+            try:
+                self._save_future.result()
+            except OSError:
+                self._queue_dirty = True
+                logger.exception("Task checkpoint failed; retrying latest snapshot on exit")
+        if self._task_path is not None and self._queue_dirty:
+            try:
+                self._model.save(self._task_path)
+            except OSError:
+                logger.exception("Unable to save final task snapshot")
 
     # --- queue key actions (cancel / retry / delete) ---
     @on(DownloadQueue.QueueAction)

@@ -49,12 +49,12 @@ def test_task_filters_details_and_cleanup(tmp_path, monkeypatch):
             assert "/tmp/partial.mp4" in detail
             assert "[不是富文本]" in detail
             app.query_one("#task-search", Input).value = "不存在"
-            await pilot.pause()
+            await pilot.pause(0.2)
             assert table.row_count == 0
             assert app.query_one("#task-delete", Button).disabled
             app.query_one("#task-search", Input).value = ""
             app.query_one("#task-filter", Select).value = "all"
-            await pilot.pause()
+            await pilot.pause(0.2)
             app.query_one("#task-clear_done", Button).press()
             await pilot.pause()
             assert model.get(complete) is None
@@ -139,6 +139,8 @@ def test_index_rows_appear_before_resolution_and_stay_in_order(tmp_path, monkeyp
                         imports = str(app.query_one("#import-status", Static).render())
                         assert "解析 3/3" in imports and "失败 1" in imports
                         restored = DownloadQueueModel()
+                        app._save_queue()
+                        await asyncio.wrap_future(app._save_future)
                         restored.restore(app._task_path)
                         assert [r.download_id for r in restored.rows()] == order
                         assert restored.rows()[-1].source == "BVthird"

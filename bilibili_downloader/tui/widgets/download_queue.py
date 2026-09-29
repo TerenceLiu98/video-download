@@ -25,6 +25,12 @@ from bilibili_downloader.core.models import VIDEO_CODEC_MAP, DownloadItem, Video
 _BAR_LEN = 10
 
 
+class TaskTitle(Text):
+    def __init__(self, row):
+        super().__init__(row.title, no_wrap=True, overflow="ellipsis")
+        self.download_id = row.download_id
+
+
 def _progress_bar(pct: int, state: str) -> str:
     """Render a Unicode progress bar string for a DataTable cell."""
     if state == "failed" or state == "error":
@@ -62,6 +68,7 @@ class DownloadQueueModel:
         self._order: list[int] = []
         self._next_id = 0
         self._workers: dict[int, object] = {}
+        self._snapshot_cache = {}
 
     # --- iteration / inspection ---
     def rows(self) -> list[Row]:
@@ -85,13 +92,24 @@ class DownloadQueueModel:
         return row.item if row else None
 
     def save(self, path: Path) -> None:
-        from dataclasses import asdict
-
         from bilibili_downloader.core.creator import atomic_write_json
+
+        atomic_write_json(path, self.snapshot())
+
+    def snapshot(self) -> dict:
+        """Detach changed rows on the UI thread; reuse immutable saved records."""
+        from copy import deepcopy
 
         records = []
         for row in self.rows():
-            record = asdict(row)
+            values = vars(row).copy()
+            values["warnings"] = list(row.warnings)
+            cached = self._snapshot_cache.get(row.download_id)
+            if cached is not None and cached[0] == values:
+                records.append(cached[1])
+                continue
+            values["resolve_options"] = deepcopy(row.resolve_options)
+            record = values.copy()
             record["item"] = row.item.model_dump(mode="json") if row.item else None
             if record["item"]:
                 # Signed stream URLs expire; only persist the video identity/options.
@@ -100,9 +118,11 @@ class DownloadQueueModel:
                 info["audio_streams"] = []
                 info["subtitle_list"] = []
             records.append(record)
-        atomic_write_json(path, {"version": 1, "rows": records})
+            self._snapshot_cache[row.download_id] = (values, record)
+        return {"version": 1, "rows": records}
 
     def restore(self, path: Path) -> None:
+        self._snapshot_cache.clear()
         if not path.exists():
             return
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -267,6 +287,7 @@ class DownloadQueueModel:
             return
         self._workers.pop(download_id, None)
         self._rows.pop(download_id, None)
+        self._snapshot_cache.pop(download_id, None)
         if download_id in self._order:
             self._order.remove(download_id)
 
@@ -313,6 +334,7 @@ class DownloadQueue(DataTable):
         self.filter_state = "all"
         self.search = ""
         self._visible_ids = []
+        self._rendered = {}
         self._layout_width = 0
         super().__init__()
 
@@ -341,22 +363,28 @@ class DownloadQueue(DataTable):
                 self.move_cursor(row=self._visible_ids.index(selected))
 
     def visible_rows(self) -> list[Row]:
+        return [row for row in self.model.rows() if self._matches(row)]
+
+    def _matches(self, row: Row) -> bool:
         states = {
             "active": {"downloading", "pausing"}, "pending": {"pending", "retry"},
             "paused": {"paused", "cancelled"}, "failed": {"failed", "error", "resolve_failed"},
             "partial": {"partial"}, "done": {"done"},
             "resolving": {"awaiting", "resolving"},
         }
-        rows = [r for r in self.model.rows()
-                if (self.filter_state == "all" or r.state in states.get(self.filter_state, set()))
-                and self.search.casefold() in (r.title + " " + r.source + " " + (r.item.video_info.bvid if r.item else "")).casefold()]
-        return rows
+        return ((self.filter_state == "all" or row.state in states.get(self.filter_state, set()))
+                and (not self.search or self.search.casefold() in
+                     (row.title + " " + row.source + " " + (row.item.video_info.bvid if row.item else "")).casefold()))
+
+    @staticmethod
+    def _signature(row):
+        return row.title, row.pct, row.state, row.status, row.speed_bps, row.eta_seconds
 
     def _cells(self, row: Row):
         color = {"failed": "red", "error": "red", "resolve_failed": "red", "partial": "yellow",
                  "done": "green", "downloading": "cyan"}.get(row.state, "white")
         status = Text(row.status, style=color, no_wrap=True, overflow="ellipsis")
-        title = Text(row.title, no_wrap=True, overflow="ellipsis")
+        title = TaskTitle(row)
         if self._compact:
             return title, f"{row.pct}%", status
         return title, _progress_bar(row.pct, row.state), *self._metrics(row), status
@@ -395,10 +423,12 @@ class DownloadQueue(DataTable):
         cursor = self.cursor_row
         selected = self._cursor_download_id()
         self.clear()
+        self._rendered.clear()
         rows = self.visible_rows()
         self._visible_ids = [r.download_id for r in rows]
         for row in rows:
             self.add_row(*self._cells(row), key=str(row.download_id))
+            self._rendered[row.download_id] = self._signature(row)
         if self.row_count:
             if selected in self._visible_ids:
                 cursor = self._visible_ids.index(selected)
@@ -422,7 +452,33 @@ class DownloadQueue(DataTable):
 
     # --- called by message handlers (main thread) ---
     def refresh_model(self) -> None:
-        self._full_refresh()
+        rows = self.visible_rows()
+        ids = [row.download_id for row in rows]
+        wanted = set(ids)
+        removed = self._rendered.keys() - wanted
+        if len(removed) > 100:
+            self._full_refresh()
+            return
+        selected = self._cursor_download_id()
+        for did in removed:
+            self.remove_row(str(did))
+            self._rendered.pop(did)
+        for row in rows:
+            signature = self._signature(row)
+            if row.download_id not in self._rendered:
+                self.add_row(*self._cells(row), key=str(row.download_id))
+            elif self._rendered[row.download_id] != signature:
+                row_index = self.get_row_index(str(row.download_id))
+                for col, value in enumerate(self._cells(row)):
+                    self.update_cell_at(Coordinate(row_index, col), value)
+            self._rendered[row.download_id] = signature
+        if ids != self._visible_ids:
+            rank = {did: i for i, did in enumerate(ids)}
+            self.sort(key=lambda cells: rank[cells[0].download_id])
+            self._visible_ids = ids
+            if selected in wanted:
+                self.move_cursor(row=rank[selected])
+        self._refresh_summary()
 
     # Positional columns are shared with on_mount and _full_refresh.
     _COL_PROGRESS = 1
@@ -442,10 +498,11 @@ class DownloadQueue(DataTable):
         row = self.model.get(download_id)
         if row is None:
             return
-        if [r.download_id for r in self.visible_rows()] != self._visible_ids:
-            self._full_refresh()
+        visible = download_id in self._rendered
+        if self._matches(row) != visible:
+            self.refresh_model()
             return
-        if download_id not in self._visible_ids:
+        if not visible:
             return
         try:
             row_index = self.get_row_index(str(download_id))
@@ -454,4 +511,4 @@ class DownloadQueue(DataTable):
             return
         for col, value in enumerate(self._cells(row)):
             self.update_cell_at(Coordinate(row_index, col), value)
-        self._refresh_summary()
+        self._rendered[download_id] = self._signature(row)
