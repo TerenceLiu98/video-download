@@ -45,6 +45,10 @@ class DownloadService:
         self._requests = RequestCancellation()
 
     @property
+    def transferred_bytes(self):
+        return self._downloader.transferred_bytes
+
+    @property
     def transfer_metrics(self):
         return self._downloader.speed_bps, self._downloader.eta_seconds
 

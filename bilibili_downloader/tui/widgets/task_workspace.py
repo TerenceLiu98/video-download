@@ -12,7 +12,7 @@ from bilibili_downloader.tui.widgets.download_queue import DownloadQueue
 class TaskWorkspace(Vertical):
     DEFAULT_CSS = """
     TaskWorkspace { height: 1fr; padding: 0 1; }
-    TaskWorkspace #task-summary { height: auto; max-height: 3; margin-bottom: 1; color: #e8e8ec; }
+    TaskWorkspace #task-summary { height: auto; margin-bottom: 1; color: #e8e8ec; }
     TaskWorkspace #import-status { height: auto; max-height: 3; color: #7cd4bb; }
     TaskWorkspace #task-filters { height: 3; }
     TaskWorkspace Select { width: 20; }
@@ -36,10 +36,10 @@ class TaskWorkspace(Vertical):
         yield Static("", id="import-status", markup=False)
         with Horizontal(id="task-filters"):
             yield Select([
-                ("全部", "all"), ("待解析/解析中", "resolving"), ("下载中", "active"), ("等待中", "pending"),
+                ("未完成", "unfinished"), ("全部记录", "all"), ("待解析/解析中", "resolving"), ("下载中", "active"), ("等待中", "pending"),
                 ("已暂停", "paused"), ("失败", "failed"), ("部分完成", "partial"),
                 ("已完成", "done"),
-            ], value="all", allow_blank=False, id="task-filter")
+            ], value="unfinished", allow_blank=False, id="task-filter")
             yield Input(placeholder="搜索标题 / BV 号", id="task-search")
         with HorizontalScroll(id="task-tools"):
             for label, action in (("导入链接", "import"), ("暂停", "cancel"),
@@ -99,7 +99,7 @@ class TaskWorkspace(Vertical):
             row is None or row.state == "pausing" or (not active and row.state not in ("pending", "retry"))
         )
         self.query_one("#task-retry", Button).disabled = (
-            row is None or active or row.state not in ("paused", "cancelled", "failed", "resolve_failed")
+            row is None or active or row.state not in ("paused", "cancelled", "failed", "resolve_failed", "resolve_interrupted")
             or (row.item is None and not row.source)
         )
         self.query_one("#task-delete", Button).disabled = row is None or active

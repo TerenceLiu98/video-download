@@ -31,13 +31,15 @@ class ResolveFailed(Message):
 # --- Download --------------------------------------------------------------
 class DownloadProgress(Message):
     def __init__(self, download_id: int, pct: float, status_text: str,
-                 speed_bps: float = 0.0, eta_seconds: float | None = None):
+                 speed_bps: float = 0.0, eta_seconds: float | None = None,
+                 transferred_bytes: int | None = None):
         super().__init__()
         self.download_id = download_id
         self.pct = pct
         self.status_text = status_text
         self.speed_bps = speed_bps
         self.eta_seconds = eta_seconds
+        self.transferred_bytes = transferred_bytes
 
 
 class DownloadFinished(Message):

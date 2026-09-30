@@ -11,6 +11,7 @@ The task workspace filters and sorts rows without changing model identity.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,14 @@ from textual.widgets import DataTable
 from bilibili_downloader.core.models import VIDEO_CODEC_MAP, DownloadItem, VideoQuality
 
 _BAR_LEN = 10
+
+
+def format_speed(speed: float) -> str:
+    if speed >= 1048576:
+        return f"{speed / 1048576:.1f} MiB/s"
+    if speed >= 1024:
+        return f"{speed / 1024:.1f} KiB/s"
+    return f"{max(0, speed):.0f} B/s"
 
 
 class TaskTitle(Text):
@@ -55,6 +64,7 @@ class Row:
     output_dir: str = ""
     speed_bps: float = 0.0
     eta_seconds: float | None = None
+    speed_updated_at: float = 0.0
     video_path: str = ""
     source: str = ""
     resolve_options: dict = field(default_factory=dict)
@@ -135,9 +145,11 @@ class DownloadQueueModel:
             row = Row(**record)
             if row.item and not row.title:
                 row.title = row.item.video_info.title
-            if row.state in ("awaiting", "resolving"):
-                row.state, row.status = "resolve_failed", "解析中断，可重试"
+            if (row.state in ("awaiting", "resolving")
+                    or (row.state == "resolve_failed" and row.status == "解析中断，可重试")):
+                row.state, row.status = "resolve_interrupted", "解析中断，可继续"
             row.speed_bps, row.eta_seconds = 0.0, None
+            row.speed_updated_at = 0.0
             if row.state in ("pending", "downloading", "retry", "pausing"):
                 row.state, row.status = "paused", "已恢复，等待继续"
             restored[row.download_id] = row
@@ -215,6 +227,7 @@ class DownloadQueueModel:
             return
         row.pct = int(pct * 100)
         row.speed_bps, row.eta_seconds = speed_bps, eta_seconds
+        row.speed_updated_at = time.monotonic()
         if row.state == "pausing":
             return
         row.status = status_text or row.status
@@ -333,7 +346,7 @@ class DownloadQueue(DataTable):
         # Set model BEFORE super().__init__: DataTable's cursor_type reactive
         # triggers watchers during init that reach refresh.
         self.model = model
-        self.filter_state = "all"
+        self.filter_state = "unfinished"
         self.search = ""
         self._visible_ids = []
         self._rendered = {}
@@ -370,11 +383,13 @@ class DownloadQueue(DataTable):
     def _matches(self, row: Row) -> bool:
         states = {
             "active": {"downloading", "pausing"}, "pending": {"pending", "retry"},
-            "paused": {"paused", "cancelled"}, "failed": {"failed", "error", "resolve_failed"},
+            "paused": {"paused", "cancelled", "resolve_interrupted"}, "failed": {"failed", "error", "resolve_failed"},
             "partial": {"partial"}, "done": {"done"},
             "resolving": {"awaiting", "resolving"},
         }
-        return ((self.filter_state == "all" or row.state in states.get(self.filter_state, set()))
+        return ((self.filter_state == "all"
+                 or (self.filter_state == "unfinished" and row.state not in ("done", "partial"))
+                 or row.state in states.get(self.filter_state, set()))
                 and (not self.search or self.search.casefold() in
                      (row.title + " " + row.source + " " + (row.item.video_info.bvid if row.item else "")).casefold()))
 
@@ -444,10 +459,11 @@ class DownloadQueue(DataTable):
 
     @staticmethod
     def _metrics(row: Row) -> tuple[str, str]:
-        if row.state != "downloading" or row.speed_bps <= 0:
+        if (row.state != "downloading" or row.speed_bps <= 0
+                or time.monotonic() - row.speed_updated_at > 2):
             return "--", "--"
         speed = row.speed_bps
-        label = f"{speed / 1048576:.1f} MiB/s" if speed >= 1048576 else f"{speed / 1024:.1f} KiB/s"
+        label = format_speed(speed)
         seconds = int(row.eta_seconds) if row.eta_seconds is not None else None
         eta = f"{seconds // 60:02d}:{seconds % 60:02d}" if seconds is not None else "--"
         return label, eta

@@ -61,6 +61,7 @@ class StreamDownloader:
         self._cancelled = False
         self._requests = RequestCancellation()
         self.speed_bps = 0.0
+        self.transferred_bytes = 0
         self.eta_seconds = None
         self.last_video_stream: Optional[StreamInfo] = None
         self.last_audio_stream: Optional[StreamInfo] = None
@@ -270,6 +271,8 @@ class StreamDownloader:
         progress_callback: Callable[[float], None],
     ) -> None:
         """Download a single .m4s stream with progress tracking and retry."""
+        self.speed_bps = 0.0
+        self.eta_seconds = None
         last_error = None
         complete_marker = dest.with_suffix(f"{dest.suffix}.complete")
         if _has_valid_completion_marker(dest, complete_marker):
@@ -399,9 +402,10 @@ class StreamDownloader:
                     raise RuntimeError("Download cancelled")
                 f.write(chunk)
                 downloaded += len(chunk)
+                self.transferred_bytes += len(chunk)
                 now = time.monotonic()
                 elapsed = now - sampled_at
-                if elapsed >= 0.5:
+                if elapsed > 0 and (elapsed >= 0.5 or (total > 0 and downloaded >= total)):
                     self.speed_bps = (downloaded - sampled_bytes) / elapsed
                     self.eta_seconds = (
                         max(0, total - downloaded) / self.speed_bps

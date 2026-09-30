@@ -38,6 +38,9 @@ def test_task_filters_details_and_cleanup(tmp_path, monkeypatch):
             table = app.query_one(DownloadQueue)
             assert not app.query_one(MainScreen).display
             assert app.query_one(TaskWorkspace).display
+            assert table._visible_ids == [active]
+            app.query_one("#task-filter", Select).value = "all"
+            await pilot.pause()
             assert table._visible_ids == [complete, partial, active]
             assert table.region.height > 20
             assert app.query_one(TaskWorkspace).region.x >= app.query_one("NavSidebar").region.right
@@ -132,12 +135,15 @@ def test_index_rows_appear_before_resolution_and_stay_in_order(tmp_path, monkeyp
                         app._model.mark_done(order[1], DownloadOutcome(video_path="/tmp/b.mp4", warnings=["无字幕"]))
                         app._refresh_queue()
                         table = app.query_one(DownloadQueue)
+                        assert table._visible_ids == order[2:]
+                        app.query_one("#task-filter", Select).value = "all"
+                        await pilot.pause()
                         assert table._visible_ids == order
                         assert app._batch_jobs[1].done == 3
                         summary = str(app.query_one("#task-summary", Static).render())
                         assert "完成 1/3" in summary and "部分完成 1" in summary
                         imports = str(app.query_one("#import-status", Static).render())
-                        assert "解析 3/3" in imports and "失败 1" in imports
+                        assert "已处理 3/3" in imports and "失败 1" in imports
                         restored = DownloadQueueModel()
                         app._save_queue()
                         await asyncio.wrap_future(app._save_future)
@@ -221,6 +227,9 @@ def test_batch_import_and_download_continue_after_navigation(tmp_path, monkeypat
                     app.pop_screen()
                     await pilot.pause()
                     await pilot.click("#nav-batch")
+                    assert app.query_one(DownloadQueue).row_count == 0
+                    app.query_one("#task-filter", Select).value = "done"
+                    await pilot.pause()
                     assert app.query_one(DownloadQueue).row_count == 1
                 finally:
                     release_resolve.set()

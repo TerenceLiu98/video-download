@@ -38,6 +38,21 @@ def test_transfer_metrics_exclude_resumed_bytes(monkeypatch, tmp_path):
     assert dest.stat().st_size == 196608
 
 
+def test_short_transfer_has_speed_and_counts_only_new_bytes(monkeypatch, tmp_path):
+    downloader = StreamDownloader(object(), str(tmp_path))
+    dest = tmp_path / "video.m4s"
+    dest.write_bytes(b"a" * 1024)
+    ticks = iter((0.0, 0.1))
+    monkeypatch.setattr("bilibili_downloader.core.downloader.time.monotonic", lambda: next(ticks))
+    response = httpx.Response(
+        206, headers={"content-range": "bytes 1024-2047/2048"}, content=b"b" * 1024,
+        request=httpx.Request("GET", "https://example.com"),
+    )
+    downloader._write_response(response, dest, 1024, lambda _: None)
+    assert downloader.transferred_bytes == 1024
+    assert downloader.speed_bps == 10240
+
+
 def test_truncated_media_is_not_marked_complete(tmp_path):
     downloader = StreamDownloader(object(), str(tmp_path))
     response = httpx.Response(

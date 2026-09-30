@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from textual import on, work
@@ -33,6 +34,7 @@ from bilibili_downloader.tui.state import AppState, BatchJob, LoginState
 from bilibili_downloader.tui.widgets.download_queue import (
     DownloadQueue,
     DownloadQueueModel,
+    format_speed,
 )
 from bilibili_downloader.tui.widgets.sidebar import NavSidebar
 from bilibili_downloader.tui.widgets.task_workspace import TaskWorkspace
@@ -110,6 +112,7 @@ class BiliFlowTUI(App):
         self._refresh_queue()
         self._show_workspace("home")
         self.set_interval(2, self._save_queue)
+        self.set_interval(1, self._refresh_transfer_display)
 
         # Sidebar control panel defaults from settings.
         self._control_panel().sync_defaults_from_settings(settings)
@@ -130,6 +133,10 @@ class BiliFlowTUI(App):
         self._queue_dirty = False
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="task-save")
         self._save_future = None
+        self._transfer_seen = {}
+        self._transfer_pending = 0
+        self._transfer_at = time.monotonic()
+        self._transfer_speed = 0.0
 
     # --- helpers to reach widgets ---
     def _sidebar(self) -> NavSidebar:
@@ -323,7 +330,7 @@ class BiliFlowTUI(App):
             for did in job.row_ids:
                 row = self._model.get(did)
                 if row and row.state in ("awaiting", "resolving"):
-                    row.state, row.status = "resolve_failed", "解析中断，可重试"
+                    row.state, row.status = "resolve_interrupted", "解析中断，可继续"
                     row.error = message.error or "解析未完成"
         self._refresh_queue()
         if message.error:
@@ -584,6 +591,7 @@ class BiliFlowTUI(App):
                                     row.output_dir or self.state.settings.output_dir,
                                     did, self.state.settings.ffmpeg_path or None)
             self._model.register_worker(did, worker)
+            self._transfer_seen[did] = 0
             self._active_downloads.add(did)
             self.run_download_worker(worker)
 
@@ -596,6 +604,10 @@ class BiliFlowTUI(App):
         assert self.state is not None
         if self._quitting:
             return
+        if isinstance(message.transferred_bytes, int):
+            previous = self._transfer_seen.get(message.download_id, 0)
+            self._transfer_pending += max(0, message.transferred_bytes - previous)
+            self._transfer_seen[message.download_id] = message.transferred_bytes
         self._queue_dirty = True
         self.state.queue.set_progress(message.download_id, message.pct, message.status_text,
                                       message.speed_bps, message.eta_seconds)
@@ -615,6 +627,7 @@ class BiliFlowTUI(App):
     def _on_download_finished(self, message: messages.DownloadFinished) -> None:
         assert self.state is not None
         self.state.queue.mark_done(message.download_id, message.outcome)
+        self._transfer_seen.pop(message.download_id, None)
         self._active_downloads.discard(message.download_id)
         self._drain_downloads()
         self._refresh_queue()
@@ -630,6 +643,7 @@ class BiliFlowTUI(App):
     def _on_download_failed(self, message: messages.DownloadFailed) -> None:
         assert self.state is not None
         self.state.queue.mark_failed(message.download_id, message.error)
+        self._transfer_seen.pop(message.download_id, None)
         self._active_downloads.discard(message.download_id)
         self._drain_downloads()
         self._refresh_queue()
@@ -641,6 +655,7 @@ class BiliFlowTUI(App):
     def _on_download_cancelled(self, message: messages.DownloadCancelled) -> None:
         assert self.state is not None
         self.state.queue.mark_cancelled(message.download_id)
+        self._transfer_seen.pop(message.download_id, None)
         self._active_downloads.discard(message.download_id)
         self._drain_downloads()
         self._refresh_queue()
@@ -662,18 +677,17 @@ class BiliFlowTUI(App):
 
         rows = self._model.rows()
         counts = Counter(r.state for r in rows)
-        speed = sum(r.speed_bps for r in rows if r.state == "downloading")
         download_total = sum(r.item is not None for r in rows)
-        summary = (f"解析：待解析 {counts['awaiting']} · 解析中 {counts['resolving']} · 失败 {counts['resolve_failed']}\n"
-                   f"下载：完成 {counts['done']}/{download_total} 分P · 部分完成 {counts['partial']} · 下载中 {counts['downloading']} · "
+        summary = (f"解析（全部记录）：待解析 {counts['awaiting']} · 解析中 {counts['resolving']} · 中断 {counts['resolve_interrupted']} · 失败 {counts['resolve_failed'] + counts['error']}\n"
+                   f"下载（全部记录）：完成 {counts['done']}/{download_total} 分P · 部分完成 {counts['partial']} · 运行 {counts['downloading'] + counts['pausing']} · "
                    f"等待 {counts['pending'] + counts['retry']} · "
-                   f"异常 {counts['failed'] + counts['error'] + counts['partial']} · "
-                   f"{speed / 1048576:.1f} MiB/s")
+                   f"暂停 {counts['paused'] + counts['cancelled']} · 失败 {counts['failed']}\n"
+                   f"媒体传输速度：{format_speed(self._transfer_speed)}")
         jobs = list(self._batch_jobs.values())
         running = [j for j in jobs if j.running]
         shown = running or jobs[-1:]
         imports = "\n".join(
-            f"导入 #{j.batch_id}：{j.total} 条 · 解析 {j.done}/{j.total} · 失败 {j.failed} · {j.status}"
+            f"本次导入 #{j.batch_id}：{j.total} 条 · 已处理 {j.done}/{j.total} · 失败 {j.failed} · {j.status}"
             for j in shown
         )
         self.query_one(TaskWorkspace).update_summary(summary, imports)
@@ -681,6 +695,21 @@ class BiliFlowTUI(App):
             f"后台导入 {len(running)} · 下载 {counts['downloading']} · "
             f"等待 {counts['pending'] + counts['retry']} · 查看任务"
         )
+
+    def _refresh_transfer_display(self) -> None:
+        if self._quitting:
+            return
+        now = time.monotonic()
+        elapsed = now - self._transfer_at
+        if elapsed <= 0:
+            return
+        self._transfer_speed = self._transfer_pending / elapsed
+        self._transfer_pending = 0
+        self._transfer_at = now
+        table = self.query_one(DownloadQueue)
+        for did in self._active_downloads:
+            table.refresh_row_by_id(did)
+        self._refresh_task_summary()
 
     def _save_queue(self) -> None:
         from bilibili_downloader.core.creator import atomic_write_json
@@ -776,7 +805,7 @@ class BiliFlowTUI(App):
     def _retry_download(self, download_id: int) -> None:
         assert self.state is not None
         row = self.state.queue.get(download_id)
-        if row and row.state == "resolve_failed" and row.source:
+        if row and row.state in ("resolve_failed", "resolve_interrupted") and row.source:
             batch_id = max(self._batch_jobs, default=0) + 1
             job = BatchJob(batch_id, 1, row.output_dir, row_ids=[download_id])
             self._batch_jobs[batch_id] = job

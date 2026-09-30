@@ -100,4 +100,6 @@ class DownloadWorker(CoreWorker):
         self._last_text = text
         self._last_emit_at = now
         metrics = self._service.transfer_metrics if self._service is not None else (0.0, None)
-        self.emit(messages.DownloadProgress(self._download_id, pct, text, *metrics))
+        transferred = self._service.transferred_bytes if self._service is not None else None
+        self.emit(messages.DownloadProgress(self._download_id, pct, text, *metrics,
+                                           transferred_bytes=transferred))
