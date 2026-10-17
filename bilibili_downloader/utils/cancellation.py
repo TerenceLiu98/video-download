@@ -2,11 +2,28 @@
 
 import socket
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 _current = ContextVar("request_cancellation", default=None)
+
+
+class OperationCancelled(RuntimeError):
+    """Raised when a user or shutdown request stops a blocking operation."""
+
+
+def cancellable_sleep(delay, cancel_checker, message="Operation cancelled"):
+    """Sleep in short slices, raising ``OperationCancelled`` once cancelled."""
+    deadline = time.monotonic() + max(0.0, delay)
+    while True:
+        if cancel_checker is not None and cancel_checker():
+            raise OperationCancelled(message)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 def attach_current_request(request):
@@ -23,7 +40,7 @@ class RequestCancellation:
 
     def attach(self, request):
         if self.cancelled.is_set():
-            raise RuntimeError("Request cancelled")
+            raise OperationCancelled("Request cancelled")
         request.extensions["trace"] = self.trace
 
     @contextmanager

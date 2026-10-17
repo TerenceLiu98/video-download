@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -16,6 +17,7 @@ from bilibili_downloader.api.client import BilibiliAPIClient
 from bilibili_downloader.api.endpoints import USER_AGENT
 from bilibili_downloader.core.creator import atomic_write_json, creator_directory_name
 from bilibili_downloader.core.models import DownloadItem
+from bilibili_downloader.utils.cancellation import OperationCancelled, cancellable_sleep
 from bilibili_downloader.utils.network import BILIBILI_RESOURCE_HOSTS, trusted_media_url
 from bilibili_downloader.utils.validators import sanitize_filename
 
@@ -135,47 +137,58 @@ class CommentArchiveDownloader:
         output_path: Path,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> None:
-        archive = {
+        """Archive every comment page, resuming from an interrupted journal.
+
+        Fetched pages are appended to ``<output>.partial.jsonl`` as they arrive
+        (constant cost per page); the final JSON is written once at the end.
+        """
+        journal = _CommentJournal(_comment_journal_path(output_path), aid, bvid)
+        try:
+            root_pages, reply_pages = journal.root_pages, journal.reply_pages
+            page = 1
+            archived_roots: list[int] = []
+            while True:
+                self._check_cancel(cancel_checker)
+                payload = root_pages.get(page)
+                if payload is None:
+                    payload = self._request(
+                        lambda: self._api_client.get_comment_page(aid, page, self._page_size),
+                        cancel_checker,
+                    )
+                    journal.append({"type": "root", "page": page, "payload": payload})
+                    root_pages[page] = payload
+                data = payload.get("data") or {}
+                replies = data.get("replies") or []
+                for root in _root_comments(data):
+                    root_id = int(root.get("rpid") or root.get("root") or 0)
+                    reply_count = int(root.get("rcount") or 0)
+                    if root_id and reply_count and root_id not in archived_roots:
+                        archived_roots.append(root_id)
+                        if str(root_id) not in reply_pages:
+                            pages = self._download_replies(aid, root_id, cancel_checker)
+                            journal.append({"type": "reply", "root": root_id, "pages": pages})
+                            reply_pages[str(root_id)] = pages
+
+                if not replies:
+                    break
+
+                page_info = data.get("page") or {}
+                total = int(page_info.get("count") or 0)
+                if page * self._page_size >= total or len(replies) < self._page_size:
+                    break
+                page += 1
+        finally:
+            journal.close()
+
+        atomic_write_json(output_path, {
             "schema_version": 1,
             "aid": aid,
             "bvid": bvid,
-            "complete": False,
-            "root_pages": [],
-            "reply_pages": {},
-        }
-        page = 1
-        archived_roots: set[int] = set()
-        while True:
-            self._check_cancel(cancel_checker)
-            payload = self._request(
-                lambda: self._api_client.get_comment_page(aid, page, self._page_size),
-                cancel_checker,
-            )
-            archive["root_pages"].append(payload)
-            data = payload.get("data") or {}
-            replies = data.get("replies") or []
-            atomic_write_json(output_path, archive)
-            for root in _root_comments(data):
-                root_id = int(root.get("rpid") or root.get("root") or 0)
-                reply_count = int(root.get("rcount") or 0)
-                if root_id and reply_count and root_id not in archived_roots:
-                    archived_roots.add(root_id)
-                    archive["reply_pages"][str(root_id)] = self._download_replies(
-                        aid, root_id, cancel_checker
-                    )
-                    atomic_write_json(output_path, archive)
-
-            if not replies:
-                break
-
-            page_info = data.get("page") or {}
-            total = int(page_info.get("count") or 0)
-            if page * self._page_size >= total or len(replies) < self._page_size:
-                break
-            page += 1
-
-        archive["complete"] = True
-        atomic_write_json(output_path, archive)
+            "complete": True,
+            "root_pages": [root_pages[number] for number in range(1, page + 1)],
+            "reply_pages": {str(root): reply_pages[str(root)] for root in archived_roots},
+        })
+        journal.discard()
 
     def _download_replies(
         self,
@@ -207,25 +220,82 @@ class CommentArchiveDownloader:
         last_error = None
         for attempt in range(self._max_retries):
             self._check_cancel(cancel_checker)
-            self._pace()
+            self._pace(cancel_checker)
             try:
                 return action()
+            except OperationCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
+                self._check_cancel(cancel_checker)
                 last_error = exc
                 if attempt + 1 < self._max_retries:
-                    time.sleep(min(8.0, 2 ** attempt))
+                    cancellable_sleep(min(8.0, 2 ** attempt), cancel_checker,
+                                      "Download cancelled by user")
         raise RuntimeError(f"评论 API 连续失败 {self._max_retries} 次：{last_error}")
 
-    def _pace(self) -> None:
+    def _pace(self, cancel_checker=None) -> None:
         remaining = self._request_interval - (time.monotonic() - self._last_request_at)
         if remaining > 0:
-            time.sleep(remaining)
+            cancellable_sleep(remaining, cancel_checker, "Download cancelled by user")
         self._last_request_at = time.monotonic()
 
     @staticmethod
     def _check_cancel(cancel_checker: Optional[Callable[[], bool]]) -> None:
         if cancel_checker and cancel_checker():
-            raise RuntimeError("Download cancelled by user")
+            raise OperationCancelled("Download cancelled by user")
+
+
+def _comment_journal_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.name}.partial.jsonl")
+
+
+class _CommentJournal:
+    """Append-only checkpoint of fetched comment pages for one video."""
+
+    def __init__(self, path: Path, aid: int, bvid: str):
+        self._path = path
+        self.root_pages: dict[int, dict] = {}
+        self.reply_pages: dict[str, list] = {}
+        header = {"type": "header", "schema_version": 1, "aid": aid, "bvid": bvid}
+        valid_bytes = self._load(header)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(path, "r+b" if valid_bytes else "wb")
+        self._handle.truncate(valid_bytes)  # drop a line torn by a crash
+        self._handle.seek(valid_bytes)
+        if not valid_bytes:
+            self.append(header)
+
+    def _load(self, header: dict) -> int:
+        """Read complete records; return the byte length that is safe to keep."""
+        try:
+            raw = self._path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        offset = 0
+        for line in raw.split(b"\n")[:-1]:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                break
+            if offset == 0 and record != header:
+                return 0  # another video's or an older journal
+            if record.get("type") == "root":
+                self.root_pages[int(record["page"])] = record["payload"]
+            elif record.get("type") == "reply":
+                self.reply_pages[str(record["root"])] = record["pages"]
+            offset += len(line) + 1
+        return offset
+
+    def append(self, record: dict) -> None:
+        self._handle.write(json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def discard(self) -> None:
+        self._path.unlink(missing_ok=True)
 
 
 def _with_artifact_suffix(video_path: Path, suffix: str) -> Path:

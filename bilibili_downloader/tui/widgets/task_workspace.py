@@ -45,7 +45,8 @@ class TaskWorkspace(Vertical):
             for label, action in (("导入链接", "import"), ("暂停", "cancel"),
                                   ("继续/重试", "retry"), ("打开目录", "open"),
                                   ("删除记录", "delete"), ("全部暂停", "cancel_all"),
-                                  ("全部继续", "resume_all"), ("清理已完成", "clear_done")):
+                                  ("全部继续", "resume_all"), ("重试失败", "retry_failed"),
+                                  ("清理已完成", "clear_done")):
                 yield Button(label, id=f"task-{action}")
         yield Static("暂无任务", id="task-empty")
         yield DownloadQueue(self.model)

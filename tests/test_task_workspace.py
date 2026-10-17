@@ -180,7 +180,7 @@ def test_batch_import_and_download_continue_after_navigation(tmp_path, monkeypat
         assert release_resolve.wait(5)
         return item("后台解析的视频").video_info
 
-    def download(_item, _callback):
+    def download(_item, _callback, **_kwargs):
         downloading.set()
         assert release_download.wait(5)
         return DownloadOutcome(video_path=str(tmp_path / "original" / "video.mp4"))

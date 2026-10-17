@@ -259,7 +259,7 @@ def test_concurrency_semaphore_caps_inflight(tmp_path):
     peak = 0
     lock = threading.Lock()
 
-    def slow_download(item, cb):
+    def slow_download(item, cb, **_kwargs):
         nonlocal active, peak
         with lock:
             active += 1

@@ -280,6 +280,14 @@ class DownloadQueueModel:
         row.status = "暂停中…"
         row.state = "pausing"
 
+    def mark_retry_wait(self, download_id: int, status: str) -> None:
+        """Queue an automatic retry; progress is kept since the parts resume."""
+        row = self._rows.get(download_id)
+        if row is None:
+            return
+        row.status = status
+        row.state = "retry"
+
     def mark_retry(self, download_id: int) -> None:
         row = self._rows.get(download_id)
         if row is None:

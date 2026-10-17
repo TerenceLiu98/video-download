@@ -92,7 +92,7 @@ def test_download_worker_emits_cancelled_when_cancelled(tmp_path):
     app = FakeApp()
     fake_service = MagicMock()
 
-    def download(item, cb):
+    def download(item, cb, **_kwargs):
         # Simulate core noticing the cancel flag.
         worker.cancel()
         raise RuntimeError("cancel")
@@ -122,7 +122,7 @@ def test_download_worker_throttles_repeated_progress_callbacks(tmp_path):
     app = FakeApp()
     fake_service = MagicMock()
 
-    def download(item, cb):
+    def download(item, cb, **_kwargs):
         # 50 callbacks all reporting 42% — a long segment streaming with no
         # integer-percent movement.
         for _ in range(50):
@@ -152,7 +152,7 @@ def test_download_worker_emits_when_percent_advances(tmp_path):
     app = FakeApp()
     fake_service = MagicMock()
 
-    def download(item, cb):
+    def download(item, cb, **_kwargs):
         for pct in (0.10, 0.20, 0.30, 0.40):
             cb(pct, "下载中")
         return DownloadOutcome(video_path=str(tmp_path / "x.mp4"))

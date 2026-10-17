@@ -1,11 +1,13 @@
 """DASH stream downloader with FFmpeg merge support."""
 
 import hashlib
+import json
 import logging
 import shutil
 import ssl
 import threading
 import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
@@ -16,9 +18,14 @@ import httpx
 from bilibili_downloader.api.client import BilibiliAPIClient
 from bilibili_downloader.api.endpoints import USER_AGENT
 from bilibili_downloader.core.archive import ArtifactPaths
+from bilibili_downloader.core.errors import TransientDownloadError, is_transient_error
 from bilibili_downloader.core.ffmpeg import FFmpegManager
 from bilibili_downloader.core.models import DownloadItem, StreamInfo, VideoQuality
-from bilibili_downloader.utils.cancellation import RequestCancellation
+from bilibili_downloader.utils.cancellation import (
+    OperationCancelled,
+    RequestCancellation,
+    cancellable_sleep,
+)
 from bilibili_downloader.utils.network import (
     BILIBILI_RESOURCE_HOSTS,
     trusted_media_url,
@@ -34,6 +41,12 @@ STREAM_HEADERS = {
 
 CHUNK_SIZE = 8192
 MAX_RETRIES = 5
+# Bilibili's CDN throttles each connection (~1 MiB/s measured), so large
+# streams are split into ranges fetched in parallel.
+SEGMENT_CONNECTIONS = 4
+SEGMENT_MIN_SIZE = 8 * 1024 * 1024
+# Signed stream URLs expire; re-sign at most this many times per stream.
+MAX_URL_REFRESHES = 2
 
 # Create an SSL context that works around CDN issues
 SSL_CONTEXT = ssl.create_default_context()
@@ -52,14 +65,17 @@ class StreamDownloader:
         output_dir: str,
         max_retries: int = MAX_RETRIES,
         ffmpeg_path: Optional[str] = None,
+        segments: int = SEGMENT_CONNECTIONS,
     ):
         self._api_client = api_client
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._max_retries = max(1, max_retries)
         self._ffmpeg_path = ffmpeg_path
+        self._segments = max(1, segments)
         self._cancelled = False
         self._requests = RequestCancellation()
+        self._metrics_lock = threading.Lock()
         self.speed_bps = 0.0
         self.transferred_bytes = 0
         self.eta_seconds = None
@@ -72,6 +88,10 @@ class StreamDownloader:
         """Signal the downloader to cancel current operation."""
         self._cancelled = True
         self._requests.cancel()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise OperationCancelled("Download cancelled by user")
 
     def download(
         self,
@@ -101,7 +121,6 @@ class StreamDownloader:
         self.last_warnings = []
         self.last_video_stream = None
         self.last_audio_stream = None
-        info = item.video_info
 
         stable_output = ArtifactPaths(self._output_dir, item).media_path
         if stable_output is not None and stable_output.is_file() and stable_output.stat().st_size > 0:
@@ -110,19 +129,7 @@ class StreamDownloader:
             return str(stable_output)
 
         progress_callback(0.0, "正在获取流地址...")
-
-        # Determine fnval flags
-        need_hdr = item.selected_quality in (VideoQuality.QHDR,)
-        need_dolby = item.selected_quality in (VideoQuality.Q_DOLBY,)
-
-        playurl_data = self._api_client.get_play_url(
-            bvid=info.bvid,
-            cid=info.cid,
-            quality=item.selected_quality,
-            need_hdr=need_hdr,
-            need_dolby=need_dolby,
-            preferred_codec=item.selected_video_codec,
-        )
+        playurl_data = self._fetch_play_url(item)
 
         # Select video stream
         video_stream = self._select_video_stream(
@@ -151,30 +158,35 @@ class StreamDownloader:
             else _reserved_output_path(requested_output)
         )
         with _reserved_download_cache(self._output_dir, item) as tmp, output_context as output_path:
+            # The cache key is the *requested* spec; the streams actually served
+            # can differ (quality fallback, login change), so never resume parts
+            # that belong to another stream.
+            _discard_mismatched_parts(tmp, video_stream, audio_stream)
             video_path = tmp / "video.m4s"
             audio_path = tmp / "audio.m4s"
 
-            # Download video stream
-            progress_callback(0.0, "正在下载视频流...")
-            self._download_stream(
-                video_stream,
-                video_path,
-                lambda p: progress_callback(p * 0.6, "正在下载视频流..."),
-            )
+            with self._media_client() as client:
+                # Download video stream
+                progress_callback(0.0, "正在下载视频流...")
+                self._download_stream(
+                    video_stream,
+                    video_path,
+                    lambda p: progress_callback(p * 0.6, "正在下载视频流..."),
+                    client=client,
+                    refresh=lambda: self._refresh_stream(item, video_stream, "video_streams"),
+                )
+                self._raise_if_cancelled()
 
-            if self._cancelled:
-                raise RuntimeError("Download cancelled by user")
-
-            # Download audio stream
-            progress_callback(0.6, "正在下载音频流...")
-            self._download_stream(
-                audio_stream,
-                audio_path,
-                lambda p: progress_callback(0.6 + p * 0.2, "正在下载音频流..."),
-            )
-
-            if self._cancelled:
-                raise RuntimeError("Download cancelled by user")
+                # Download audio stream
+                progress_callback(0.6, "正在下载音频流...")
+                self._download_stream(
+                    audio_stream,
+                    audio_path,
+                    lambda p: progress_callback(0.6 + p * 0.2, "正在下载音频流..."),
+                    client=client,
+                    refresh=lambda: self._refresh_stream(item, audio_stream, "audio_streams"),
+                )
+                self._raise_if_cancelled()
 
             # Merge with FFmpeg
             self.speed_bps = 0.0
@@ -194,6 +206,7 @@ class StreamDownloader:
                 cancel_checker=lambda: self._cancelled,
                 **merge_kwargs,
             )
+            self._raise_if_cancelled()
             if not success and cover_path is not None:
                 self.last_warnings.append(f"封面嵌入失败，已保留独立封面：{msg}")
                 merge_kwargs.pop("cover_path", None)
@@ -205,6 +218,7 @@ class StreamDownloader:
                     cancel_checker=lambda: self._cancelled,
                     **merge_kwargs,
                 )
+                self._raise_if_cancelled()
             if not success:
                 raise RuntimeError(f"FFmpeg merge failed: {msg}")
 
@@ -214,6 +228,38 @@ class StreamDownloader:
 
             progress_callback(1.0, "视频下载完成")
             return str(output_path)
+
+    def _fetch_play_url(self, item: DownloadItem) -> dict:
+        info = item.video_info
+        return self._api_client.get_play_url(
+            bvid=info.bvid,
+            cid=info.cid,
+            quality=item.selected_quality,
+            need_hdr=item.selected_quality in (VideoQuality.QHDR,),
+            need_dolby=item.selected_quality in (VideoQuality.Q_DOLBY,),
+            preferred_codec=item.selected_video_codec,
+        )
+
+    def _refresh_stream(self, item: DownloadItem, current: StreamInfo, key: str) -> StreamInfo:
+        """Fetch fresh signed URLs for exactly the stream being downloaded."""
+        self._raise_if_cancelled()
+        streams = self._fetch_play_url(item)[key]
+        for stream in streams:
+            if stream.id == current.id and stream.codecid == current.codecid:
+                return stream
+        raise RuntimeError("流地址已过期，重新获取后找不到相同规格的流")
+
+    def _media_client(self) -> httpx.Client:
+        """One pooled client per download, shared by both streams and segments."""
+        transport = httpx.HTTPTransport(
+            http2=False,
+            retries=1,
+            verify=SSL_CONTEXT,
+        )
+        return httpx.Client(
+            transport=transport,
+            event_hooks={"request": [self._requests.attach]},
+        )
 
     def _select_video_stream(
         self,
@@ -269,11 +315,16 @@ class StreamDownloader:
         stream: StreamInfo,
         dest: Path,
         progress_callback: Callable[[float], None],
+        client: Optional[httpx.Client] = None,
+        refresh: Optional[Callable[[], StreamInfo]] = None,
     ) -> None:
-        """Download a single .m4s stream with progress tracking and retry."""
+        """Download a single .m4s stream with progress tracking and retry.
+
+        ``refresh`` re-signs the stream URLs when every mirror rejects the
+        current ones as expired (403/404/410); it does not consume a retry.
+        """
         self.speed_bps = 0.0
         self.eta_seconds = None
-        last_error = None
         complete_marker = dest.with_suffix(f"{dest.suffix}.complete")
         if _has_valid_completion_marker(dest, complete_marker):
             progress_callback(1.0)
@@ -282,68 +333,64 @@ class StreamDownloader:
         if not urls:
             raise RuntimeError("下载失败：流地址为空")
 
-        # Reuse a single httpx.Client across all retries for connection pooling
-        transport = httpx.HTTPTransport(
-            http2=False,
-            retries=1,
-            verify=SSL_CONTEXT,
-        )
-        with httpx.Client(transport=transport, event_hooks={"request": [self._requests.attach]}) as client:
-            for attempt in range(self._max_retries):
-                if self._cancelled:
-                    raise RuntimeError("Download cancelled")
+        if client is None:
+            with self._media_client() as own_client:
+                self._download_stream(stream, dest, progress_callback, own_client, refresh)
+            return
 
-                for url in urls:
+        last_error = None
+        refreshes = 0
+        attempt = 0
+        while attempt < self._max_retries:
+            self._raise_if_cancelled()
+            expired = True
+            for url in urls:
+                try:
+                    self._download_url(client, url, dest, progress_callback)
                     try:
-                        self._download_url(client, url, dest, progress_callback)
-                        try:
-                            complete_marker.write_text(
-                                str(dest.stat().st_size), encoding="ascii"
-                            )
-                        except OSError:
-                            # The media is complete even if the optional resume marker
-                            # cannot be persisted (for example on a read-only mount).
-                            logger.debug(
-                                "Unable to write completion marker %s",
-                                complete_marker,
-                                exc_info=True,
-                            )
-                        return
-                    except (
-                        httpx.HTTPError,
-                        ConnectionError,
-                        OSError,
-                        ValueError,
-                    ) as e:
-                        if self._cancelled:
-                            raise RuntimeError("Download cancelled") from e
-                        last_error = e
-                        logger.debug(
-                            "Download attempt %d failed for %s: %s",
-                            attempt + 1, url, e,
+                        complete_marker.write_text(
+                            str(dest.stat().st_size), encoding="ascii"
                         )
+                    except OSError:
+                        # The media is complete even if the optional resume marker
+                        # cannot be persisted (for example on a read-only mount).
+                        logger.debug(
+                            "Unable to write completion marker %s",
+                            complete_marker,
+                            exc_info=True,
+                        )
+                    return
+                except (
+                    httpx.HTTPError,
+                    ConnectionError,
+                    OSError,
+                    ValueError,
+                ) as e:
+                    if self._cancelled:
+                        raise OperationCancelled("Download cancelled") from e
+                    last_error = e
+                    expired = expired and _is_expired_url_error(e)
+                    logger.debug(
+                        "Download attempt %d failed for %s: %s",
+                        attempt + 1, url, e,
+                    )
 
-                if attempt < self._max_retries - 1:
-                    delay = _retry_delay(attempt, last_error)
-                    self._wait_for_retry(delay)
+            if expired and refresh is not None and refreshes < MAX_URL_REFRESHES:
+                refreshes += 1
+                logger.info("Stream URLs expired; requesting fresh signed URLs")
+                urls = _stream_urls(refresh()) or urls
+                continue
+            attempt += 1
+            if attempt < self._max_retries:
+                delay = _retry_delay(attempt - 1, last_error)
+                self._wait_for_retry(delay)
 
-        raise RuntimeError(
-            f"下载失败：{last_error}"
-        )
+        error_type = TransientDownloadError if is_transient_error(last_error) else RuntimeError
+        raise error_type(f"下载失败：{last_error}") from last_error
 
-    def _download_url(
-        self,
-        client: httpx.Client,
-        url: str,
-        dest: Path,
-        progress_callback: Callable[[float], None],
-    ) -> None:
-        """Download one URL, resuming from an existing partial file when possible."""
-        resume_from = dest.stat().st_size if dest.exists() else 0
-        headers = dict(STREAM_HEADERS)
-        if resume_from > 0:
-            headers["Range"] = f"bytes={resume_from}-"
-
+    @contextmanager
+    def _open_media(self, client: httpx.Client, url: str, headers: dict):
+        """Open a media response, following only redirects to trusted CDN hosts."""
         current_url = trusted_media_url(url, BILIBILI_RESOURCE_HOSTS)
         for _ in range(8):
             with client.stream(
@@ -362,9 +409,46 @@ class StreamDownloader:
                         BILIBILI_RESOURCE_HOSTS,
                     )
                     continue
-                self._write_response(response, dest, resume_from, progress_callback)
+                yield response
                 return
         raise RuntimeError("下载失败：媒体地址重定向次数过多")
+
+    def _download_url(
+        self,
+        client: httpx.Client,
+        url: str,
+        dest: Path,
+        progress_callback: Callable[[float], None],
+    ) -> None:
+        """Download one URL, resuming from existing partial data when possible.
+
+        Large files on servers that honour ranges are fetched over several
+        connections, because the CDN throttles each connection individually.
+        """
+        plan = _load_segment_plan(dest)
+        if plan is None and self._segments > 1 and not dest.exists():
+            total = self._probe_range_support(client, url)
+            if total is not None and total >= SEGMENT_MIN_SIZE:
+                plan = _new_segment_plan(dest, total, self._segments)
+        if plan is not None:
+            self._download_segments(client, url, dest, plan, progress_callback)
+            return
+
+        resume_from = dest.stat().st_size if dest.exists() else 0
+        headers = dict(STREAM_HEADERS)
+        if resume_from > 0:
+            headers["Range"] = f"bytes={resume_from}-"
+        with self._open_media(client, url, headers) as response:
+            self._write_response(response, dest, resume_from, progress_callback)
+
+    def _probe_range_support(self, client: httpx.Client, url: str) -> Optional[int]:
+        """Return the media size when the server serves byte ranges, else None."""
+        headers = dict(STREAM_HEADERS, Range="bytes=0-0")
+        with self._open_media(client, url, headers) as response:
+            if response.status_code != 206 or _content_range_start(response) != 0:
+                return None
+            total = _content_range_total(response)
+            return total if total > 0 else None
 
     def _write_response(
         self,
@@ -389,6 +473,7 @@ class StreamDownloader:
                 )
         downloaded = resume_from if append else 0
         total = _response_total_size(response, downloaded)
+        _check_expected_total(dest, total, append, response.request)
         mode = "ab" if append else "wb"
 
         last_reported = -1.0
@@ -398,8 +483,7 @@ class StreamDownloader:
         self.eta_seconds = None
         with open(dest, mode) as f:
             for chunk in response.iter_bytes(chunk_size=65536):
-                if self._cancelled:
-                    raise RuntimeError("Download cancelled")
+                self._raise_if_cancelled()
                 f.write(chunk)
                 downloaded += len(chunk)
                 self.transferred_bytes += len(chunk)
@@ -425,13 +509,121 @@ class StreamDownloader:
             raise httpx.ProtocolError("媒体流不完整，保留分片等待续传", request=response.request)
         progress_callback(1.0)
 
+    def _download_segments(
+        self,
+        client: httpx.Client,
+        url: str,
+        dest: Path,
+        plan: dict,
+        progress_callback: Callable[[float], None],
+    ) -> None:
+        """Fetch every unfinished byte range in parallel, then join the parts."""
+        total = plan["total"]
+        ranges = plan["ranges"]
+        parts = [_segment_part(dest, index) for index in range(len(ranges))]
+        done = [_segment_done(part, start, end) for part, (start, end) in zip(parts, ranges)]
+        progress = {"bytes": sum(done)}
+        stop = threading.Event()
+
+        pending = [index for index, (start, end) in enumerate(ranges)
+                   if done[index] < end - start + 1]
+        sampled_at = time.monotonic()
+        sampled_bytes = progress["bytes"]
+        self.speed_bps = 0.0
+        self.eta_seconds = None
+        if pending:
+            pool = ThreadPoolExecutor(max_workers=len(pending), thread_name_prefix="media-segment")
+            futures = [
+                pool.submit(
+                    self._fetch_segment, client, url, parts[index],
+                    ranges[index][0] + done[index], ranges[index][1], total, dest, progress, stop,
+                )
+                for index in pending
+            ]
+            try:
+                while True:
+                    finished, running = wait(futures, timeout=0.25, return_when=FIRST_EXCEPTION)
+                    failed = next((f for f in finished if f.exception() is not None), None)
+                    if failed is not None:
+                        raise failed.exception()
+                    self._raise_if_cancelled()
+                    now = time.monotonic()
+                    with self._metrics_lock:
+                        current = progress["bytes"]
+                    if now - sampled_at >= 0.5:
+                        self.speed_bps = (current - sampled_bytes) / (now - sampled_at)
+                        self.eta_seconds = (
+                            max(0, total - current) / self.speed_bps if self.speed_bps > 0 else None
+                        )
+                        sampled_at, sampled_bytes = now, current
+                    progress_callback(min(current / total, 1.0))
+                    if not running:
+                        break
+            finally:
+                stop.set()
+                pool.shutdown(wait=True)
+
+        for part, (start, end) in zip(parts, ranges):
+            if _segment_done(part, start, end) != end - start + 1:
+                raise httpx.ProtocolError("分段数据不完整，保留分段等待续传", request=None)
+        # Grow the first part in place so the join needs at most one segment of
+        # extra disk space. The plan survives until the end, so a crash here only
+        # re-fetches the parts already consumed.
+        parts[0].replace(dest)
+        with open(dest, "ab") as output:
+            for part in parts[1:]:
+                with open(part, "rb") as source:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+                part.unlink()
+        if dest.stat().st_size != total:
+            dest.unlink(missing_ok=True)
+            raise httpx.ProtocolError("分段合并后的大小不正确", request=None)
+        _segment_plan_path(dest).unlink(missing_ok=True)
+        progress_callback(1.0)
+
+    def _fetch_segment(
+        self,
+        client: httpx.Client,
+        url: str,
+        part: Path,
+        start: int,
+        end: int,
+        total: int,
+        dest: Path,
+        progress: dict,
+        stop: threading.Event,
+    ) -> None:
+        headers = dict(STREAM_HEADERS, Range=f"bytes={start}-{end}")
+        with self._open_media(client, url, headers) as response:
+            response.raise_for_status()
+            if (response.status_code != 206 or _content_range_start(response) != start
+                    or _content_range_total(response) != total):
+                # The server stopped honouring ranges or the file changed; drop
+                # the plan so the next attempt starts over on one connection.
+                _discard_segments(dest)
+                raise httpx.ProtocolError(
+                    "服务器分段响应与本地分段不一致，已丢弃分段重新下载",
+                    request=response.request,
+                )
+            written = start
+            with open(part, "ab") as f:
+                for chunk in response.iter_bytes(chunk_size=65536):
+                    if self._cancelled or stop.is_set():
+                        raise OperationCancelled("Download cancelled")
+                    f.write(chunk[: end + 1 - written])
+                    count = min(len(chunk), end + 1 - written)
+                    written += count
+                    with self._metrics_lock:
+                        progress["bytes"] += count
+                        self.transferred_bytes += count
+                    if written > end:
+                        return
+        if written <= end:
+            raise httpx.ProtocolError("媒体分段不完整，保留分段等待续传", request=None)
+
     def _wait_for_retry(self, delay: float) -> None:
         """Wait between retries while remaining responsive to cancellation."""
-        deadline = time.monotonic() + delay
-        while time.monotonic() < deadline:
-            if self._cancelled:
-                raise RuntimeError("Download cancelled")
-            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        cancellable_sleep(delay, lambda: self._cancelled, "Download cancelled")
 
 
 def _stream_urls(stream: StreamInfo) -> list[str]:
@@ -474,6 +666,124 @@ def _retry_delay(attempt: int, error: Optional[BaseException]) -> float:
     if "SSL" in error_msg or "UNEXPECTED_EOF" in error_msg:
         return 3 * (attempt + 1)
     return 2 ** attempt
+
+
+def _content_range_total(response: httpx.Response) -> int:
+    total = response.headers.get("content-range", "").rsplit("/", 1)[-1]
+    return int(total) if total.isdigit() else 0
+
+
+def _is_expired_url_error(error: BaseException) -> bool:
+    return (isinstance(error, httpx.HTTPStatusError)
+            and error.response.status_code in (403, 404, 410))
+
+
+def _read_int(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _total_marker(dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.total")
+
+
+def _check_expected_total(dest: Path, total: int, append: bool, request) -> None:
+    """Refuse to append to a partial file that belongs to a different file size."""
+    if total <= 0:
+        return
+    marker = _total_marker(dest)
+    expected = _read_int(marker)
+    if append and expected is not None and expected != total:
+        dest.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+        raise httpx.ProtocolError(
+            "服务器文件大小与本地分片不一致，已丢弃分片重新下载", request=request
+        )
+    if expected != total:
+        try:
+            marker.write_text(str(total), encoding="ascii")
+        except OSError:
+            logger.debug("Unable to write size marker %s", marker, exc_info=True)
+
+
+def _stream_identity(stream: StreamInfo) -> list[int]:
+    return [stream.id, stream.codecid]
+
+
+def _discard_mismatched_parts(tmp: Path, video: StreamInfo, audio: StreamInfo) -> None:
+    """Drop cached parts unless they were fetched for exactly these streams."""
+    manifest = tmp / "streams.json"
+    expected = {"version": 1, "video": _stream_identity(video), "audio": _stream_identity(audio)}
+    try:
+        current = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        current = None
+    if current == expected:
+        return
+    for child in tmp.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+    manifest.write_text(json.dumps(expected), encoding="utf-8")
+
+
+def _segment_plan_path(dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.segments.json")
+
+
+def _segment_part(dest: Path, index: int) -> Path:
+    return dest.with_name(f"{dest.name}.part{index}")
+
+
+def _discard_segments(dest: Path) -> None:
+    for path in [_segment_plan_path(dest), *dest.parent.glob(f"{dest.name}.part*")]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Windows cannot delete a part another segment still has open; a
+            # new plan clears it once every segment has stopped.
+            logger.debug("Unable to remove segment file %s", path, exc_info=True)
+
+
+def _new_segment_plan(dest: Path, total: int, segments: int) -> dict:
+    _discard_segments(dest)
+    size = -(-total // segments)
+    ranges = [[start, min(total, start + size) - 1] for start in range(0, total, size)]
+    plan = {"version": 1, "total": total, "ranges": ranges}
+    _segment_plan_path(dest).write_text(json.dumps(plan), encoding="utf-8")
+    return plan
+
+
+def _load_segment_plan(dest: Path) -> Optional[dict]:
+    path = _segment_plan_path(dest)
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        total, ranges = int(plan["total"]), [[int(s), int(e)] for s, e in plan["ranges"]]
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError):
+        _discard_segments(dest)
+        return None
+    contiguous = all(prev[1] + 1 == cur[0] for prev, cur in zip(ranges, ranges[1:]))
+    if not ranges or ranges[0][0] != 0 or ranges[-1][1] != total - 1 or not contiguous:
+        _discard_segments(dest)
+        return None
+    return {"version": 1, "total": total, "ranges": ranges}
+
+
+def _segment_done(part: Path, start: int, end: int) -> int:
+    """Bytes already fetched for a range; oversized parts are corrupt and reset."""
+    try:
+        size = part.stat().st_size
+    except FileNotFoundError:
+        return 0
+    if size > end - start + 1:
+        part.unlink(missing_ok=True)
+        return 0
+    return size
 
 
 def _range_already_complete(response: httpx.Response, dest: Path) -> bool:

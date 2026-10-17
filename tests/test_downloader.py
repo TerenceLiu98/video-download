@@ -1,5 +1,7 @@
 """Tests for stream downloader retry helpers."""
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -250,3 +252,236 @@ def test_download_stream_reuses_only_matching_completion_marker(
         lambda _progress: None,
     )
     assert calls == ["downloaded"]
+
+
+MEDIA_URL = "https://upos-sz.bilivideo.com/video.m4s"
+
+
+def _range_server(payload: bytes, *, honour_ranges=True, requests=None, status=None):
+    """Mock CDN serving ``payload`` with optional byte-range support."""
+
+    def handler(request):
+        if requests is not None:
+            requests.append(request.headers.get("range"))
+        if status is not None:
+            return httpx.Response(status, request=request)
+        header = request.headers.get("range")
+        if not header or not honour_ranges:
+            return httpx.Response(200, content=payload, request=request)
+        start, _, end = header.removeprefix("bytes=").partition("-")
+        start, end = int(start), int(end) if end else len(payload) - 1
+        return httpx.Response(
+            206,
+            headers={"content-range": f"bytes {start}-{end}/{len(payload)}"},
+            content=payload[start:end + 1],
+            request=request,
+        )
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_mismatched_stream_parts_are_discarded_before_resume(tmp_path):
+    """A partial 480P fallback must not be continued with 1080P bytes."""
+    from bilibili_downloader.core.downloader import _discard_mismatched_parts
+
+    audio = StreamInfo(id=30280, codecid=0)
+    _discard_mismatched_parts(tmp_path, StreamInfo(id=32, codecid=7), audio)
+    (tmp_path / "video.m4s").write_bytes(b"480p-head")
+    (tmp_path / "video.m4s.complete").write_text("9", encoding="ascii")
+
+    _discard_mismatched_parts(tmp_path, StreamInfo(id=32, codecid=7), audio)
+    assert (tmp_path / "video.m4s").read_bytes() == b"480p-head"
+
+    _discard_mismatched_parts(tmp_path, StreamInfo(id=80, codecid=7), audio)
+    assert not (tmp_path / "video.m4s").exists()
+    assert not (tmp_path / "video.m4s.complete").exists()
+
+
+def test_legacy_parts_without_manifest_are_discarded(tmp_path):
+    from bilibili_downloader.core.downloader import _discard_mismatched_parts
+
+    (tmp_path / "video.m4s").write_bytes(b"unknown origin")
+    _discard_mismatched_parts(tmp_path, StreamInfo(id=80), StreamInfo(id=30280))
+
+    assert not (tmp_path / "video.m4s").exists()
+
+
+def test_resume_is_rejected_when_remote_size_changed(tmp_path):
+    from bilibili_downloader.core.downloader import _total_marker
+
+    dest = tmp_path / "video.m4s"
+    dest.write_bytes(b"abc")
+    _total_marker(dest).write_text("6", encoding="ascii")
+    response = httpx.Response(
+        206, headers={"content-range": "bytes 3-8/9"}, content=b"defghi",
+        request=httpx.Request("GET", MEDIA_URL),
+    )
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path))
+
+    with pytest.raises(httpx.ProtocolError, match="大小"):
+        downloader._write_response(response, dest, 3, lambda _p: None)
+    assert not dest.exists()
+
+
+def test_large_stream_downloads_in_parallel_segments(monkeypatch, tmp_path):
+    monkeypatch.setattr("bilibili_downloader.core.downloader.SEGMENT_MIN_SIZE", 10)
+    payload = bytes(range(256)) * 40
+    requests = []
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path), segments=4)
+    dest = tmp_path / "video.m4s"
+
+    with _range_server(payload, requests=requests) as client:
+        downloader._download_stream(StreamInfo(base_url=MEDIA_URL), dest, lambda _p: None, client=client)
+
+    assert dest.read_bytes() == payload
+    assert downloader.transferred_bytes == len(payload)
+    assert sorted(requests)[0] == "bytes=0-0"  # range probe
+    assert len([r for r in requests if r != "bytes=0-0"]) == 4
+    assert list(tmp_path.glob("video.m4s.part*")) == []
+    assert not (tmp_path / "video.m4s.segments.json").exists()
+
+
+def test_interrupted_segments_resume_only_missing_bytes(monkeypatch, tmp_path):
+    from bilibili_downloader.core.downloader import _new_segment_plan, _segment_part
+
+    payload = bytes(range(200))
+    dest = tmp_path / "video.m4s"
+    plan = _new_segment_plan(dest, len(payload), 2)
+    _segment_part(dest, 0).write_bytes(payload[:100])        # finished
+    _segment_part(dest, 1).write_bytes(payload[100:130])     # interrupted
+    requests = []
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path))
+
+    with _range_server(payload, requests=requests) as client:
+        downloader._download_url(client, MEDIA_URL, dest, lambda _p: None)
+
+    assert plan["ranges"] == [[0, 99], [100, 199]]
+    assert requests == ["bytes=130-199"]
+    assert dest.read_bytes() == payload
+
+
+def test_server_without_range_support_uses_single_connection(monkeypatch, tmp_path):
+    monkeypatch.setattr("bilibili_downloader.core.downloader.SEGMENT_MIN_SIZE", 10)
+    payload = b"z" * 500
+    requests = []
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path))
+    dest = tmp_path / "video.m4s"
+
+    with _range_server(payload, honour_ranges=False, requests=requests) as client:
+        downloader._download_url(client, MEDIA_URL, dest, lambda _p: None)
+
+    assert dest.read_bytes() == payload
+    assert requests == ["bytes=0-0", None]
+
+
+def test_expired_stream_urls_are_resigned_without_spending_retries(tmp_path):
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path), max_retries=1)
+    fresh = "https://upos-sz.bilivideo.com/fresh.m4s"
+    refreshed = []
+
+    def handler(request):
+        if request.url.path == "/video.m4s":
+            return httpx.Response(403, request=request)
+        return httpx.Response(200, content=b"media", request=request)
+
+    def refresh():
+        refreshed.append(True)
+        return StreamInfo(base_url=fresh)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        downloader._download_stream(
+            StreamInfo(base_url=MEDIA_URL), tmp_path / "video.m4s", lambda _p: None,
+            client=client, refresh=refresh,
+        )
+
+    assert refreshed == [True]
+    assert (tmp_path / "video.m4s").read_bytes() == b"media"
+
+
+def test_exhausted_network_retries_raise_transient_error(monkeypatch, tmp_path):
+    from bilibili_downloader.core.errors import (
+        TransientDownloadError,
+        is_transient_error,
+    )
+
+    downloader = StreamDownloader(api_client=object(), output_dir=str(tmp_path), max_retries=1)
+
+    def offline(*_args):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(downloader, "_download_url", offline)
+    with pytest.raises(TransientDownloadError) as caught:
+        downloader._download_stream(StreamInfo(base_url=MEDIA_URL), tmp_path / "v.m4s", lambda _p: None)
+    assert is_transient_error(caught.value)
+
+
+def test_permanent_http_errors_are_not_transient():
+    from bilibili_downloader.core.errors import is_transient_error
+    from bilibili_downloader.utils.cancellation import OperationCancelled
+
+    request = httpx.Request("GET", MEDIA_URL)
+    forbidden = httpx.HTTPStatusError("403", request=request, response=httpx.Response(403, request=request))
+    throttled = httpx.HTTPStatusError("429", request=request, response=httpx.Response(429, request=request))
+
+    assert not is_transient_error(forbidden)
+    assert is_transient_error(throttled)
+    assert not is_transient_error(OperationCancelled("stop"))
+    assert not is_transient_error(OSError(28, "No space left on device"))
+
+
+def _fallback_api(stream_ids):
+    """Fake API whose playurl serves the next quality from ``stream_ids`` per call."""
+
+    class API:
+        def get_play_url(self, **_kwargs):
+            qid = stream_ids.pop(0)
+            return {
+                "video_streams": [StreamInfo(id=qid, codecid=7,
+                                             base_url=f"https://upos-sz.bilivideo.com/{qid}.m4s")],
+                "audio_streams": [StreamInfo(id=30280, codecid=0,
+                                             base_url="https://upos-sz.bilivideo.com/audio.m4s")],
+            }
+
+    return API()
+
+
+def _run_fallback_scenario(monkeypatch, tmp_path):
+    from bilibili_downloader.core import downloader as module
+    from bilibili_downloader.core.models import VideoQuality
+
+    media = {"/32.m4s": b"L" * 40, "/80.m4s": b"H" * 100, "/audio.m4s": b"A" * 10}
+    fail_audio = {"on": True}
+
+    def handler(request):
+        body = media[request.url.path]
+        if request.url.path == "/audio.m4s" and fail_audio["on"]:
+            raise httpx.ConnectError("offline", request=request)
+        header = request.headers.get("range")
+        if header:
+            start = int(header.removeprefix("bytes=").split("-")[0])
+            return httpx.Response(206, content=body[start:], request=request,
+                                  headers={"content-range": f"bytes {start}-{len(body) - 1}/{len(body)}"})
+        return httpx.Response(200, content=body, request=request)
+
+    def merge(video, audio, merged, **_kwargs):
+        merged.write_bytes(video.read_bytes() + audio.read_bytes())
+        return True, ""
+
+    monkeypatch.setattr(module.StreamDownloader, "_media_client",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(module.FFmpegManager, "merge_streams", merge)
+    item = DownloadItem(video_info=VideoInfo(bvid="BV1xx", cid=1, title="clip"),
+                        selected_quality=VideoQuality.Q1080P, selected_video_codec=7)
+    downloader = StreamDownloader(_fallback_api([32, 80]), str(tmp_path), max_retries=1, segments=1)
+
+    with pytest.raises(RuntimeError):
+        downloader.download(item, lambda *_a: None)      # logged out: 480P video done, audio fails
+    fail_audio["on"] = False
+    return Path(downloader.download(item, lambda *_a: None))   # logged in: 1080P served
+
+
+def test_resume_after_quality_change_never_merges_stale_video(monkeypatch, tmp_path):
+    output = _run_fallback_scenario(monkeypatch, tmp_path)
+
+    assert output.read_bytes() == b"H" * 100 + b"A" * 10
+

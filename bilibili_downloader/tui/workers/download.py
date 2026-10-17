@@ -2,8 +2,7 @@
 
 Each download gets its OWN ``DownloadService`` instance because the service
 holds mutable per-download state (``self._cancelled``, ``downloader.last_*``);
-they share the httpx client (thread-safe) and the module-level
-``_SIDECAR_LOCK``. Mirrors ``gui/threads/download_worker.py`` semantics
+they share the httpx client (thread-safe). Mirrors ``gui/threads/download_worker.py`` semantics
 without Qt.
 """
 
@@ -12,8 +11,10 @@ from __future__ import annotations
 import logging
 import time
 
+from bilibili_downloader.core.errors import is_transient_error
 from bilibili_downloader.tui import messages
 from bilibili_downloader.tui.workers.base import CoreWorker
+from bilibili_downloader.utils.cancellation import OperationCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -56,20 +57,24 @@ class DownloadWorker(CoreWorker):
             def progress_cb(pct: float, text: str) -> None:
                 if self._cancel.is_set():
                     self._service.cancel()
-                    raise RuntimeError("cancel")
+                    raise OperationCancelled("Download cancelled by user")
                 self._emit_progress(pct, text)
 
-            outcome = self._service.download(self._item, progress_cb)
+            outcome = self._service.download(
+                self._item, progress_cb,
+                media_ready=lambda: self.emit(messages.DownloadArchiving(self._download_id)),
+            )
             if self._cancel.is_set():
                 self.emit(messages.DownloadCancelled(self._download_id))
             else:
                 self.emit(messages.DownloadFinished(self._download_id, outcome))
         except Exception as exc:  # noqa: BLE001
-            if self._cancel.is_set() or "cancel" in str(exc).lower():
+            if self._cancel.is_set() or isinstance(exc, OperationCancelled):
                 self.emit(messages.DownloadCancelled(self._download_id))
             else:
                 logger.error("download %s failed: %s", self._download_id, exc)
-                self.emit(messages.DownloadFailed(self._download_id, str(exc)))
+                self.emit(messages.DownloadFailed(self._download_id, str(exc),
+                                                  retryable=is_transient_error(exc)))
 
     def cancel(self) -> None:  # type: ignore[override]
         super().cancel()

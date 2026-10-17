@@ -5,9 +5,11 @@ sidebar, the persistent download queue, and all background-worker launchers.
 Every blocking core call runs in a thread via ``@work(thread=True)`` and reports
 back via Textual Messages (see ``tui/messages.py``).
 
-Only tasks with a free concurrency slot are submitted to the thread pool.
-Each task gets its own ``DownloadService`` (mutable
-per-download state) but shares the httpx client + module ``_SIDECAR_LOCK``.
+Only tasks with a free concurrency slot are submitted to the thread pool. A
+task frees its slot once its MP4 is merged and only sidecar archiving remains.
+Network failures retry automatically, and repeated ones pause dispatch for a
+cooldown instead of failing the whole queue. Each task gets its own
+``DownloadService`` (mutable per-download state) but shares the httpx client.
 """
 
 from __future__ import annotations
@@ -53,6 +55,17 @@ from bilibili_downloader.utils.config import ConfigManager
 from bilibili_downloader.utils.validators import is_bilibili_url
 
 logger = logging.getLogger(__name__)
+
+# Delays (seconds) before automatically retrying a download that failed on a
+# network or risk-control error; one entry per attempt.
+_AUTO_RETRY_DELAYS = (30.0, 120.0, 300.0)
+# After this many consecutive network failures, stop starting new downloads for
+# a cooldown instead of burning through the whole queue while offline.
+_BREAKER_THRESHOLD = 3
+_BREAKER_COOLDOWNS = (30.0, 60.0, 120.0, 300.0)
+# Tasks whose MP4 is done but that still archive sidecars free their bandwidth
+# slot; cap how many may wait in that phase so threads do not pile up.
+_ARCHIVE_BACKLOG = 8
 
 
 class BiliFlowTUI(App):
@@ -124,7 +137,12 @@ class BiliFlowTUI(App):
         super().__init__()
         self.state: AppState | None = None
         self._pending_downloads = {}
-        self._active_downloads = set()
+        self._active_downloads = set()      # media phase; counts against concurrency
+        self._archiving = set()             # sidecar phase; slot already released
+        self._auto_retries: dict[int, int] = {}
+        self._network_failures = 0
+        self._breaker_trips = 0
+        self._dispatch_paused_until = 0.0
         self._model = DownloadQueueModel()
         self._creator_worker = None
         self._task_path = None
@@ -580,8 +598,12 @@ class BiliFlowTUI(App):
 
     def _drain_downloads(self) -> None:
         assert self.state is not None
+        if time.monotonic() < self._dispatch_paused_until:
+            return
+        limit = self.state.settings.max_concurrent_downloads
         while (not self._quitting and self._pending_downloads
-               and len(self._active_downloads) < self.state.settings.max_concurrent_downloads):
+               and len(self._active_downloads) < limit
+               and len(self._active_downloads) + len(self._archiving) < limit + _ARCHIVE_BACKLOG):
             did = next(iter(self._pending_downloads))
             item = self._pending_downloads.pop(did)
             row = self._model.get(did)
@@ -606,6 +628,8 @@ class BiliFlowTUI(App):
             return
         if isinstance(message.transferred_bytes, int):
             previous = self._transfer_seen.get(message.download_id, 0)
+            if message.transferred_bytes > previous:
+                self._network_failures = 0
             self._transfer_pending += max(0, message.transferred_bytes - previous)
             self._transfer_seen[message.download_id] = message.transferred_bytes
         self._queue_dirty = True
@@ -623,12 +647,28 @@ class BiliFlowTUI(App):
             self._refresh_queue()
         self._refresh_task_summary()
 
+    @on(messages.DownloadArchiving)
+    def _on_download_archiving(self, message: messages.DownloadArchiving) -> None:
+        """Media is done; hand the bandwidth slot to the next queued task."""
+        self._network_failures = self._breaker_trips = 0
+        if message.download_id in self._active_downloads:
+            self._active_downloads.discard(message.download_id)
+            self._archiving.add(message.download_id)
+            self._drain_downloads()
+            self._refresh_task_summary()
+
+    def _release_download(self, download_id: int) -> None:
+        self._transfer_seen.pop(download_id, None)
+        self._active_downloads.discard(download_id)
+        self._archiving.discard(download_id)
+
     @on(messages.DownloadFinished)
     def _on_download_finished(self, message: messages.DownloadFinished) -> None:
         assert self.state is not None
         self.state.queue.mark_done(message.download_id, message.outcome)
-        self._transfer_seen.pop(message.download_id, None)
-        self._active_downloads.discard(message.download_id)
+        self._release_download(message.download_id)
+        self._auto_retries.pop(message.download_id, None)
+        self._network_failures = self._breaker_trips = 0
         self._drain_downloads()
         self._refresh_queue()
         if self._quitting:
@@ -643,20 +683,61 @@ class BiliFlowTUI(App):
     def _on_download_failed(self, message: messages.DownloadFailed) -> None:
         assert self.state is not None
         self.state.queue.mark_failed(message.download_id, message.error)
-        self._transfer_seen.pop(message.download_id, None)
-        self._active_downloads.discard(message.download_id)
+        self._release_download(message.download_id)
+        retrying = False
+        if message.retryable and not self._quitting:
+            self._record_network_failure()
+            retrying = self._schedule_auto_retry(message.download_id)
         self._drain_downloads()
         self._refresh_queue()
-        if self._quitting:
+        if self._quitting or retrying:
             return
         self.notify(f"下载失败：{message.error}", severity="error")
+
+    def _record_network_failure(self) -> None:
+        self._network_failures += 1
+        # Failures of downloads already in flight when the breaker opened do
+        # not extend or re-announce the cooldown.
+        if (self._network_failures < _BREAKER_THRESHOLD
+                or time.monotonic() < self._dispatch_paused_until):
+            return
+        delay = _BREAKER_COOLDOWNS[min(self._breaker_trips, len(_BREAKER_COOLDOWNS) - 1)]
+        self._breaker_trips += 1
+        self._network_failures = 0
+        self._dispatch_paused_until = time.monotonic() + delay
+        self.set_timer(delay + 0.05, self._drain_downloads)
+        self.notify(f"网络连续出错，暂停启动新任务 {delay:g} 秒", severity="warning")
+
+    def _schedule_auto_retry(self, download_id: int) -> bool:
+        attempt = self._auto_retries.get(download_id, 0)
+        if attempt >= len(_AUTO_RETRY_DELAYS):
+            return False
+        self._auto_retries[download_id] = attempt + 1
+        delay = _AUTO_RETRY_DELAYS[attempt]
+        self._model.mark_retry_wait(
+            download_id, f"网络异常，{delay:g} 秒后自动重试（{attempt + 1}/{len(_AUTO_RETRY_DELAYS)}）"
+        )
+        self.set_timer(delay, lambda: self._fire_auto_retry(download_id))
+        return True
+
+    def _fire_auto_retry(self, download_id: int) -> None:
+        row = self._model.get(download_id)
+        # The user may have paused or deleted the row while it waited.
+        if self._quitting or row is None or row.state != "retry" or row.item is None:
+            return
+        self._launch_download(download_id, row.item)
+        self._refresh_queue()
+
+    def _resume_dispatch(self) -> None:
+        """An explicit user retry overrides the network cooldown."""
+        self._network_failures = self._breaker_trips = 0
+        self._dispatch_paused_until = 0.0
 
     @on(messages.DownloadCancelled)
     def _on_download_cancelled(self, message: messages.DownloadCancelled) -> None:
         assert self.state is not None
         self.state.queue.mark_cancelled(message.download_id)
-        self._transfer_seen.pop(message.download_id, None)
-        self._active_downloads.discard(message.download_id)
+        self._release_download(message.download_id)
         self._drain_downloads()
         self._refresh_queue()
 
@@ -680,9 +761,13 @@ class BiliFlowTUI(App):
         download_total = sum(r.item is not None for r in rows)
         summary = (f"解析（全部记录）：待解析 {counts['awaiting']} · 解析中 {counts['resolving']} · 中断 {counts['resolve_interrupted']} · 失败 {counts['resolve_failed'] + counts['error']}\n"
                    f"下载（全部记录）：完成 {counts['done']}/{download_total} 分P · 部分完成 {counts['partial']} · 运行 {counts['downloading'] + counts['pausing']} · "
+                   f"其中归档 {len(self._archiving)} · "
                    f"等待 {counts['pending'] + counts['retry']} · "
                    f"暂停 {counts['paused'] + counts['cancelled']} · 失败 {counts['failed']}\n"
                    f"媒体传输速度：{format_speed(self._transfer_speed)}")
+        paused_for = self._dispatch_paused_until - time.monotonic()
+        if paused_for > 0 and (self._pending_downloads or counts["retry"]):
+            summary += f" · 网络异常，{paused_for:.0f} 秒后恢复启动新任务"
         jobs = list(self._batch_jobs.values())
         running = [j for j in jobs if j.running]
         shown = running or jobs[-1:]
@@ -707,7 +792,7 @@ class BiliFlowTUI(App):
         self._transfer_pending = 0
         self._transfer_at = now
         table = self.query_one(DownloadQueue)
-        for did in self._active_downloads:
+        for did in self._active_downloads | self._archiving:
             table.refresh_row_by_id(did)
         self._refresh_task_summary()
 
@@ -759,9 +844,17 @@ class BiliFlowTUI(App):
             self.state.queue.cancel_all()
             self.notify("已请求暂停所有任务")
         elif action == "resume_all":
+            self._resume_dispatch()
             for row in self._model.rows():
                 if row.state in ("paused", "cancelled"):
                     self._retry_download(row.download_id)
+        elif action == "retry_failed":
+            self._resume_dispatch()
+            failed = [row.download_id for row in self._model.rows()
+                      if row.state in ("failed", "resolve_failed")]
+            for failed_id in failed:
+                self._retry_download(failed_id)
+            self.notify(f"已重新排队 {len(failed)} 个失败任务" if failed else "没有失败的任务")
         elif action == "clear_done":
             for row in self._model.rows():
                 if row.state == "done":
@@ -777,6 +870,7 @@ class BiliFlowTUI(App):
             self.state.queue.delete(did)
             self._pending_downloads.pop(did, None)
         elif action == "retry":
+            self._resume_dispatch()
             self._retry_download(did)
         self._refresh_queue()
 
@@ -815,6 +909,7 @@ class BiliFlowTUI(App):
             return
         if row is None or row.state not in ("failed", "paused", "cancelled"):
             return
+        self._auto_retries.pop(download_id, None)
         if self.state.queue.get_worker(download_id) is not None:
             return
         item = self.state.queue.get_item(download_id)
@@ -867,7 +962,8 @@ class BiliFlowTUI(App):
         screen = self.screen
         if not isinstance(screen, ShutdownScreen):
             return
-        while (self._active_downloads or any(j.running for j in self._batch_jobs.values())
+        while (self._active_downloads or self._archiving
+               or any(j.running for j in self._batch_jobs.values())
                or any(w.is_running or w.is_pending for w in self.workers if w.group != "shutdown")):
             screen.set_status("正在停止后台任务，保留下载分片…")
             await asyncio.sleep(0.05)

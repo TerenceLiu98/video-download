@@ -527,8 +527,8 @@ def _download_creator_entries(client, settings, output_dir, index, entries, args
 
     # Each task gets its own DownloadService because the service holds
     # per-download mutable state (self._cancelled, downloader.last_*).
-    # They share the httpx client (thread-safe) and the module-level
-    # _SIDECAR_LOCK that guards companion-file writes.
+    # They share the httpx client (thread-safe); sidecar writes are serialized
+    # per video and comment archives run one at a time process-wide.
     def _process(position, entry):
         service = DownloadService(
             client, str(output_dir), ffmpeg_path=settings.ffmpeg_path or None

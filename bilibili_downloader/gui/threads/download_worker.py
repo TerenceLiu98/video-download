@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from bilibili_downloader.api.client import BilibiliAPIClient
 from bilibili_downloader.core.download_service import DownloadService
 from bilibili_downloader.core.models import DownloadItem
+from bilibili_downloader.utils.cancellation import OperationCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +63,17 @@ class DownloadWorker(QObject):
             def progress_cb(pct: float, text: str):
                 if self._cancelled:
                     self._service.cancel()
-                    raise RuntimeError("Cancelled")
+                    raise OperationCancelled("Cancelled")
                 self.progress.emit(self._download_id, pct, text)
 
             outcome = self._service.download(self._item, progress_cb)
 
             if self._cancelled:
-                raise RuntimeError("Cancelled")
+                raise OperationCancelled("Cancelled")
             self.finished.emit(self._download_id, outcome)
 
         except Exception as e:
-            if self._cancelled or "cancel" in str(e).lower():
+            if self._cancelled or isinstance(e, OperationCancelled):
                 logger.info("Download cancelled for %s", self._item.video_info.title)
                 self.cancelled.emit(self._download_id)
             else:

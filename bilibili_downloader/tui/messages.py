@@ -49,11 +49,21 @@ class DownloadFinished(Message):
         self.outcome = outcome
 
 
+class DownloadArchiving(Message):
+    """The MP4 is in place; only companion-file archiving remains."""
+
+    def __init__(self, download_id: int):
+        super().__init__()
+        self.download_id = download_id
+
+
 class DownloadFailed(Message):
-    def __init__(self, download_id: int, error: str):
+    def __init__(self, download_id: int, error: str, retryable: bool = False):
         super().__init__()
         self.download_id = download_id
         self.error = error
+        # Network / risk-control failures that a later automatic retry may fix.
+        self.retryable = retryable
 
 
 class DownloadCancelled(Message):

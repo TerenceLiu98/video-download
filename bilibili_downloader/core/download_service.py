@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -21,10 +22,20 @@ from bilibili_downloader.core.danmaku import DanmakuDownloader
 from bilibili_downloader.core.downloader import StreamDownloader
 from bilibili_downloader.core.models import DownloadItem, DownloadOutcome, SubtitleInfo
 from bilibili_downloader.core.subtitle import SubtitleDownloader
-from bilibili_downloader.utils.cancellation import RequestCancellation
+from bilibili_downloader.utils.cancellation import (
+    OperationCancelled,
+    RequestCancellation,
+)
 
 logger = logging.getLogger(__name__)
-_SIDECAR_LOCK = threading.Lock()
+
+# Sidecars of one video are written by one task at a time; different videos
+# archive concurrently.
+_VIDEO_LOCKS: dict[Path, list] = {}
+_VIDEO_LOCKS_GUARD = threading.Lock()
+# Comment archives page through a rate-limited API for minutes, so only one runs
+# at a time process-wide (keeps the global comment request rate unchanged).
+_COMMENT_ARCHIVE_SLOT = threading.Semaphore(1)
 
 
 class DownloadService:
@@ -61,14 +72,22 @@ class DownloadService:
         self,
         item: DownloadItem,
         progress_callback: Callable[[float, str], None],
+        media_ready: Optional[Callable[[], None]] = None,
     ) -> DownloadOutcome:
+        """Download media, then archive its companion files.
+
+        ``media_ready`` fires once the MP4 is in place, before the (possibly
+        slow) sidecar archiving, so schedulers can hand the bandwidth slot to
+        the next task.
+        """
         with self._requests.bind():
-            return self._download(item, progress_callback)
+            return self._download(item, progress_callback, media_ready)
 
     def _download(
         self,
         item: DownloadItem,
         progress_callback: Callable[[float, str], None],
+        media_ready: Optional[Callable[[], None]] = None,
     ) -> DownloadOutcome:
         self._cancelled = False
         paths = ArtifactPaths(self._output_dir, item)
@@ -81,7 +100,10 @@ class DownloadService:
                 raw_metadata = self._api_client.get_video_info_raw(
                     item.video_info.bvid
                 )
+            except OperationCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
+                self._raise_if_cancelled()
                 logger.warning("Metadata archive failed for %s: %s", item.video_info.bvid, exc)
                 preparation_warnings.append(f"元信息获取失败：{exc}")
 
@@ -98,6 +120,9 @@ class DownloadService:
         if item.embed_cover and cover_for_merge is not None:
             download_kwargs["cover_path"] = cover_for_merge
         video_path = self._downloader.download(item, video_progress, **download_kwargs)
+        self._raise_if_cancelled()
+        if media_ready is not None:
+            media_ready()
         video_file = Path(video_path)
         sidecars = paths.sidecars(video_file)
         outcome = DownloadOutcome(
@@ -157,7 +182,10 @@ class DownloadService:
         try:
             download_cover(item.video_info.cover_url, cover_path)
             return cover_path
+        except OperationCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
+            self._raise_if_cancelled()
             logger.warning("Cover download failed for %s: %s", item.video_info.bvid, exc)
             warnings.append(f"封面下载失败：{exc}")
             return None
@@ -172,7 +200,7 @@ class DownloadService:
         outcome: DownloadOutcome,
         progress_callback: Callable[[float, str], None],
     ) -> None:
-        with _SIDECAR_LOCK:
+        with self._video_lock(sidecars["metadata"], progress_callback):
             if item.download_metadata and raw_metadata is not None:
                 try:
                     if _needs_write(sidecars["metadata"], item.refresh_sidecars):
@@ -188,7 +216,7 @@ class DownloadService:
                     ):
                         sidecars["cover"].parent.mkdir(parents=True, exist_ok=True)
                         temporary = sidecars["cover"].with_name(
-                            f".{sidecars['cover'].name}.tmp"
+                            f".{sidecars['cover'].name}.{threading.get_ident()}.tmp"
                         )
                         shutil.copy2(cover_for_merge, temporary)
                         temporary.replace(sidecars["cover"])
@@ -210,16 +238,21 @@ class DownloadService:
             outcome.comments_path = str(path)
             return
         self._raise_if_cancelled()
-        progress_callback(0.86, "正在归档评论和回复...")
+        progress_callback(0.86, "等待评论归档队列...")
         try:
-            CommentArchiveDownloader(self._api_client).download(
-                item.video_info.aid,
-                item.video_info.bvid,
-                path,
-                cancel_checker=lambda: self._cancelled,
-            )
+            with self._acquire(_COMMENT_ARCHIVE_SLOT):
+                progress_callback(0.86, "正在归档评论和回复...")
+                CommentArchiveDownloader(self._api_client).download(
+                    item.video_info.aid,
+                    item.video_info.bvid,
+                    path,
+                    cancel_checker=lambda: self._cancelled,
+                )
             outcome.comments_path = str(path)
+        except OperationCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
+            self._raise_if_cancelled()
             logger.warning("Comment archive failed for %s: %s", item.video_info.bvid, exc)
             outcome.warnings.append(f"评论归档失败：{exc}")
 
@@ -243,7 +276,10 @@ class DownloadService:
                 )
             outcome.danmaku_xml_path = str(xml_path)
             outcome.danmaku_path = str(ass_path)
+        except OperationCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
+            self._raise_if_cancelled()
             logger.warning("Danmaku download failed for %s: %s", item.video_info.bvid, exc)
             outcome.warnings.append(f"弹幕下载失败：{exc}")
 
@@ -260,7 +296,10 @@ class DownloadService:
             path.parent.mkdir(parents=True, exist_ok=True)
             SubtitleDownloader.download_and_convert(subtitle.url, path)
             outcome.subtitle_paths.append(str(path))
+        except OperationCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
+            self._raise_if_cancelled()
             logger.warning("Subtitle download failed for %s: %s", item.video_info.bvid, exc)
             outcome.warnings.append(f"字幕下载失败：{exc}")
 
@@ -291,7 +330,34 @@ class DownloadService:
 
     def _raise_if_cancelled(self) -> None:
         if self._cancelled:
-            raise RuntimeError("Download cancelled by user")
+            raise OperationCancelled("Download cancelled by user")
+
+    @contextmanager
+    def _acquire(self, lock):
+        """Wait for ``lock`` while staying responsive to cancellation."""
+        while not lock.acquire(timeout=0.1):
+            self._raise_if_cancelled()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @contextmanager
+    def _video_lock(self, sidecar: Path, progress_callback):
+        key = sidecar.resolve()
+        with _VIDEO_LOCKS_GUARD:
+            entry = _VIDEO_LOCKS.setdefault(key, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            if entry[0].locked():
+                progress_callback(0.84, "同一视频的归档文件正在写入，等待中...")
+            with self._acquire(entry[0]):
+                yield
+        finally:
+            with _VIDEO_LOCKS_GUARD:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    _VIDEO_LOCKS.pop(key, None)
 
 
 def _needs_write(path: Path, refresh: bool) -> bool:

@@ -363,3 +363,98 @@ def test_incomplete_comment_checkpoint_is_refetched(tmp_path):
     assert api.calls == 1
     assert outcome.comments_path == str(comments)
     assert json.loads(comments.read_text(encoding="utf-8"))["complete"] is True
+
+
+class InterruptingCommentAPI(FakeCommentAPI):
+    """Fails the first reply request for root 40, after page 1 and root 10 are fetched."""
+
+    def __init__(self):
+        super().__init__()
+        self.page_calls = []
+        self.fail_root_40 = True
+
+    def get_comment_page(self, aid, page, page_size):
+        self.page_calls.append(page)
+        return super().get_comment_page(aid, page, page_size)
+
+    def get_comment_replies(self, aid, root, page, page_size):
+        if root == 40 and self.fail_root_40:
+            raise KeyboardInterrupt  # simulate the process dying mid-archive
+        return super().get_comment_replies(aid, root, page, page_size)
+
+
+def test_comment_archive_resumes_from_journal_without_refetching(tmp_path):
+    api = InterruptingCommentAPI()
+    path = tmp_path / "comments.json"
+    archiver = CommentArchiveDownloader(api, request_interval=0, page_size=2, max_retries=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        archiver.download(99, "BV0000000001", path)
+    assert not path.exists()
+    assert (tmp_path / "comments.json.partial.jsonl").exists()
+
+    api.fail_root_40 = False
+    api.page_calls.clear()
+    api.reply_calls.clear()
+    archiver.download(99, "BV0000000001", path)
+
+    assert api.page_calls == [2]                 # page 1 came from the journal
+    assert api.reply_calls == [(40, 1)]          # root 10 replies came from the journal
+    archive = json.loads(path.read_text(encoding="utf-8"))
+    assert archive["complete"] is True
+    assert len(archive["root_pages"]) == 2
+    assert list(archive["reply_pages"]) == ["10", "40"]
+    assert not (tmp_path / "comments.json.partial.jsonl").exists()
+
+
+def test_comment_journal_tolerates_torn_last_line(tmp_path):
+    from bilibili_downloader.core.archive import _CommentJournal
+
+    journal_path = tmp_path / "comments.json.partial.jsonl"
+    journal = _CommentJournal(journal_path, 99, "BV0000000001")
+    journal.append({"type": "root", "page": 1, "payload": {"data": {}}})
+    journal.close()
+    with open(journal_path, "ab") as handle:
+        handle.write(b'{"type": "root", "pa')     # crash while appending
+
+    reopened = _CommentJournal(journal_path, 99, "BV0000000001")
+    reopened.append({"type": "root", "page": 2, "payload": {"data": {}}})
+    reopened.close()
+
+    assert sorted(_CommentJournal(journal_path, 99, "BV0000000001").root_pages) == [1, 2]
+
+
+def test_comment_journal_of_another_video_is_ignored(tmp_path):
+    from bilibili_downloader.core.archive import _CommentJournal
+
+    journal_path = tmp_path / "comments.json.partial.jsonl"
+    other = _CommentJournal(journal_path, 1, "BV_OTHER")
+    other.append({"type": "root", "page": 1, "payload": {"data": {}}})
+    other.close()
+
+    journal = _CommentJournal(journal_path, 99, "BV0000000001")
+    journal.close()
+    assert journal.root_pages == {}
+
+
+def test_comment_retry_wait_stops_promptly_on_cancel(tmp_path):
+    import time
+
+    from bilibili_downloader.utils.cancellation import OperationCancelled
+
+    class FlakyAPI:
+        def get_comment_page(self, *_args):
+            raise RuntimeError("temporary")
+
+    cancelled = {"at": None}
+
+    def cancel_checker():
+        return cancelled["at"] is not None and time.monotonic() >= cancelled["at"]
+
+    cancelled["at"] = time.monotonic() + 0.2
+    started = time.monotonic()
+    with pytest.raises(OperationCancelled):
+        CommentArchiveDownloader(FlakyAPI(), request_interval=0).download(
+            99, "BV0000000001", tmp_path / "comments.json", cancel_checker=cancel_checker
+        )
+    assert time.monotonic() - started < 2   # retries back off up to 8s otherwise

@@ -92,3 +92,79 @@ def test_service_keeps_video_success_when_companion_fails(monkeypatch, tmp_path)
     assert outcome.video_path.endswith("video.mp4")
     assert outcome.is_partial
     assert "弹幕下载失败" in outcome.warnings[0]
+
+
+def _media_only_service(tmp_path, api, name):
+    service = DownloadService(api, str(tmp_path))
+
+    def fake_download(item, callback, **_kwargs):
+        service._downloader.last_video_stream = StreamInfo(id=80, codecid=12)
+        return str(tmp_path / f"{name}.mp4")
+
+    service._downloader.download = fake_download
+    return service
+
+
+def test_sidecars_of_different_videos_archive_concurrently(monkeypatch, tmp_path):
+    import threading
+
+    barrier = threading.Barrier(2, timeout=3)
+
+    def danmaku(cid, *_args):
+        barrier.wait()   # deadlocks (BrokenBarrierError) if archiving is serialized
+
+    monkeypatch.setattr(
+        "bilibili_downloader.core.download_service.DanmakuDownloader.download_and_convert", danmaku
+    )
+    results = []
+
+    def run(name, cid):
+        item = DownloadItem(video_info=VideoInfo(bvid=f"BV{name}", cid=cid), download_danmaku=True)
+        outcome = _media_only_service(tmp_path, FakeAPI(), name).download(item, lambda *_a: None)
+        results.append(outcome.warnings)
+
+    threads = [threading.Thread(target=run, args=(name, cid)) for name, cid in (("a", 1), ("b", 2))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert results == [[], []]
+
+
+def test_task_waiting_for_comment_queue_cancels_promptly(tmp_path):
+    import threading
+    import time
+
+    import pytest
+
+    from bilibili_downloader.core import download_service as module
+    from bilibili_downloader.utils.cancellation import OperationCancelled
+
+    service = _media_only_service(tmp_path, FakeAPI(), "c")
+    item = DownloadItem(video_info=VideoInfo(bvid="BVc", cid=3, aid=3), download_comments=True)
+    statuses = []
+    assert module._COMMENT_ARCHIVE_SLOT.acquire(timeout=1)   # another video is archiving
+    try:
+        threading.Timer(0.2, service.cancel).start()
+        started = time.monotonic()
+        with pytest.raises(OperationCancelled):
+            service.download(item, lambda _p, text: statuses.append(text))
+        assert time.monotonic() - started < 1
+        assert "等待评论归档队列..." in statuses
+    finally:
+        module._COMMENT_ARCHIVE_SLOT.release()
+
+
+def test_media_ready_fires_before_sidecar_archiving(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr(
+        "bilibili_downloader.core.download_service.DanmakuDownloader.download_and_convert",
+        lambda *_args: events.append("danmaku"),
+    )
+    item = DownloadItem(video_info=VideoInfo(bvid="BVd", cid=4), download_danmaku=True)
+
+    _media_only_service(tmp_path, FakeAPI(), "d").download(
+        item, lambda *_a: None, media_ready=lambda: events.append("media_ready")
+    )
+
+    assert events == ["media_ready", "danmaku"]

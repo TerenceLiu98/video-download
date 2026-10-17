@@ -90,7 +90,7 @@ def test_large_pending_queue_exits_without_starting_pending_downloads(tmp_path, 
     service = MagicMock()
     service.cancel.side_effect = cancelled.set
 
-    def download(*_):
+    def download(*_args, **_kwargs):
         assert cancelled.wait(5)
         raise RuntimeError("Download cancelled")
 
