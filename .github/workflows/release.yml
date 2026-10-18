@@ -127,9 +127,70 @@ jobs:
             ${{ matrix.archive_name }}-${{ github.ref_name }}.cdx.json
           if-no-files-found: error
 
+  build-cli:
+    name: Build CLI ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+            archive_name: biliflow-cli-macOS
+          - os: windows-latest
+            label: Windows
+            archive_name: biliflow-cli-Windows
+          - os: ubuntu-latest
+            label: Linux
+            archive_name: biliflow-cli-Linux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CLI dependencies (no GUI/TUI)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints.txt -e . PyInstaller
+
+      - name: Build CLI binary
+        run: pyinstaller --noconfirm --clean BiliFlowCLI.spec
+
+      - name: Smoke test CLI binary
+        shell: bash
+        run: |
+          bin=dist/biliflow-cli
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --help
+          "$bin" batch --help
+
+      - name: Package CLI (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          zip -9 "../${{ matrix.archive_name }}-${{ github.ref_name }}.zip" biliflow-cli
+
+      - name: Package CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/biliflow-cli.exe" -DestinationPath "${{ matrix.archive_name }}-${{ github.ref_name }}.zip" -Force
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}-${{ github.ref_name }}
+          path: ${{ matrix.archive_name }}-${{ github.ref_name }}.zip
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-cli]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

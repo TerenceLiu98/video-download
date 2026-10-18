@@ -54,6 +54,15 @@ pyinstaller --noconfirm --clean BilibiliDownloader.spec
 - spec 根据平台选择 `app_icon.icns`、`app_icon.ico` 或 `app_icon.png`。
 - `packaging_hooks/hook-keyring.py` 只收集目标系统的凭据库后端，避免携带其他平台实现。
 
+纯 CLI 单文件程序（不包含 Qt 与 Textual）：
+
+```bash
+python -m pip install -c constraints.txt . PyInstaller   # 只装命令行依赖
+pyinstaller --noconfirm --clean BiliFlowCLI.spec
+```
+
+生成 `dist/biliflow-cli`（Windows 为 `dist/biliflow-cli.exe`）。Release 流程会在 macOS、Windows 和 Linux 上分别构建并发布 `biliflow-cli-<系统>-<version>.zip`。CI 的 `cli-headless` 任务只安装基础依赖，确认 CLI 不会引入 GUI/TUI 包。
+
 重新生成应用图标：
 
 ```bash

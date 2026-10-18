@@ -58,6 +58,27 @@ jobs:
       - name: Run static checks
         run: ruff check bilibili_downloader tests packaging_hooks
 
+  cli-headless:
+    # The base install must run the CLI without PySide6 or Textual.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CLI only
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints.txt -e .
+      - name: Verify GUI/TUI packages are absent and CLI runs
+        run: |
+          ! python -c "import PySide6" 2>/dev/null
+          ! python -c "import textual" 2>/dev/null
+          biliflow-cli --help
+          biliflow-cli batch --help
+          biliflow-cli login --help
+          python -m bilibili_downloader.cli --help
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +89,6 @@ jobs:
       - name: Install project and auditor
         run: |
           python -m pip install --upgrade pip
-          pip install -c constraints.txt -e . pip-audit
+          pip install -c constraints.txt -e ".[all]" pip-audit
       - name: Audit installed dependencies
         run: pip-audit

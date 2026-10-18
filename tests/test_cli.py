@@ -170,3 +170,136 @@ def test_creator_batch_isolates_failures_and_exits_nonzero(monkeypatch, tmp_path
     # Two succeeded, one failed and is listed in the failure summary.
     assert "✗ BV000000000001" in out
     assert "1 个任务失败" in out
+
+
+def test_cli_main_without_command_prints_help_and_never_launches_gui(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_configure_logging", lambda **kw: None)
+    monkeypatch.setattr(cli, "_launch_gui", lambda: pytest.fail("GUI launched"))
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cli_main([])
+    assert exc_info.value.code == 2
+    out = capsys.readouterr().out
+    assert "batch" in out and "login" in out and "logout" in out
+
+
+def test_cli_main_has_no_tui_subcommand(monkeypatch):
+    monkeypatch.setattr(cli, "_configure_logging", lambda **kw: None)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cli_main(["tui"])
+    assert exc_info.value.code == 2
+
+
+def _install_batch_fakes(monkeypatch, tmp_path, captured):
+    class FakeClient:
+        def __init__(self, sessdata=None):
+            self.sessdata = sessdata
+
+        def get_video_info(self, bvid):
+            pages = [VideoPage(cid=1, page=1, part="A"), VideoPage(cid=2, page=2, part="B")]
+            return VideoInfo(bvid=bvid, cid=1, title=f"title-{bvid}", pages=pages)
+
+        def close(self):
+            pass
+
+    class FakeService:
+        def __init__(self, client, output_dir, ffmpeg_path=None):
+            assert output_dir == str(tmp_path)
+
+        def download(self, item, callback):
+            captured.append(item)
+            return DownloadOutcome(video_path=str(tmp_path / item.filename))
+
+    monkeypatch.setattr("bilibili_downloader.api.client.BilibiliAPIClient", FakeClient)
+    monkeypatch.setattr(
+        "bilibili_downloader.core.download_service.DownloadService", FakeService
+    )
+    monkeypatch.setattr(
+        "bilibili_downloader.utils.config.ConfigManager.load",
+        lambda self: AppSettings(output_dir=str(tmp_path), sessdata="token"),
+    )
+    monkeypatch.setattr(cli, "_configure_logging", lambda **kw: None)
+
+
+def test_cli_batch_reads_args_and_files_dedupes_and_skips_invalid(
+    monkeypatch, tmp_path, capsys
+):
+    captured = []
+    _install_batch_fakes(monkeypatch, tmp_path, captured)
+    links = tmp_path / "links.txt"
+    links.write_text(
+        "https://www.bilibili.com/video/BV1GJ411x7h7\nnot a link\n\nBV1xx411c7mD\n",
+        encoding="utf-8",
+    )
+
+    cli.cli_main(["batch", "BV1GJ411x7h7", "--file", str(links), "-j", "1"])
+
+    out = capsys.readouterr().out
+    assert "跳过无法识别的输入：not a link" in out
+    bvids = [item.video_info.bvid for item in captured]
+    # BV1GJ411x7h7 appears twice in the input but downloads once (both parts).
+    assert sorted(set(bvids)) == ["BV1GJ411x7h7", "BV1xx411c7mD"]
+    assert len(captured) == 4
+    assert "[2/2] ✓" in out
+
+
+def test_cli_batch_first_page_only(monkeypatch, tmp_path):
+    captured = []
+    _install_batch_fakes(monkeypatch, tmp_path, captured)
+    cli.cli_main(["batch", "BV1GJ411x7h7", "--first-page"])
+    assert [item.video_info.cid for item in captured] == [1]
+
+
+def test_cli_batch_without_inputs_exits_nonzero(monkeypatch, tmp_path, capsys):
+    _install_batch_fakes(monkeypatch, tmp_path, [])
+    monkeypatch.setattr("sys.stdin", type("TTY", (), {"isatty": lambda self: True})())
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cli_main(["batch"])
+    assert exc_info.value.code == 1
+    assert "没有可下载的链接" in capsys.readouterr().out
+
+
+def test_logout_clears_saved_sessdata(monkeypatch, tmp_path, capsys):
+    from bilibili_downloader.cli import login as cli_login_module
+    from bilibili_downloader.utils.config import ConfigManager
+
+    saved = []
+    monkeypatch.setattr(
+        ConfigManager, "load", lambda self: AppSettings(sessdata="token")
+    )
+    monkeypatch.setattr(ConfigManager, "save", lambda self, settings: saved.append(settings))
+    cli_login_module.cli_logout()
+    assert saved and saved[0].sessdata == ""
+    assert "已退出登录" in capsys.readouterr().out
+
+
+def test_login_status_reports_logged_in_user(monkeypatch, capsys):
+    from bilibili_downloader.cli import login as cli_login_module
+    from bilibili_downloader.utils.config import ConfigManager
+
+    class FakeClient:
+        def __init__(self, sessdata=None):
+            assert sessdata == "token"
+
+        def get_nav_info(self):
+            return {"isLogin": True, "uname": "测试用户", "mid": 42, "vipStatus": 1}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ConfigManager, "load", lambda self: AppSettings(sessdata="token"))
+    monkeypatch.setattr(cli_login_module, "BilibiliAPIClient", FakeClient)
+    cli_login_module.cli_login(argparse.Namespace(status=True, sessdata=None))
+    assert "已登录：测试用户（UID 42，大会员）" in capsys.readouterr().out
+    # The success message after a fresh login reads the same unwrapped mapping.
+    assert cli_login_module._whoami("token") == ("测试用户", "42")
+
+
+def test_login_status_without_credentials_exits_nonzero(monkeypatch, capsys):
+    from bilibili_downloader.cli import login as cli_login_module
+    from bilibili_downloader.utils.config import ConfigManager
+
+    monkeypatch.setattr(ConfigManager, "load", lambda self: AppSettings(sessdata=""))
+    with pytest.raises(SystemExit) as exc_info:
+        cli_login_module.cli_login(argparse.Namespace(status=True, sessdata=None))
+    assert exc_info.value.code == 1
+    assert "当前未登录" in capsys.readouterr().out

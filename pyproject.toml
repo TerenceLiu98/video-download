@@ -5,21 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bilibili-downloader"
 dynamic = ["version"]
-description = "Bilibili video downloader with desktop GUI, terminal UI, and CLI modes"
+description = "Bilibili video downloader with CLI, optional desktop GUI and terminal UI"
 requires-python = ">=3.10"
+# Base install is the headless CLI; the GUI and TUI are opt-in extras.
 dependencies = [
-    "PySide6>=6.6",
     "httpx[http2]>=0.27",
     "pydantic>=2.0",
     "qrcode[pil]>=7.4",
     "Pillow>=10.0",
     "defusedxml>=0.7",
     "keyring>=25.0",
-    "textual>=0.86",
 ]
 
 [project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+tui = ["textual>=0.86"]
+all = ["PySide6>=6.6", "textual>=0.86"]
 dev = [
+    "PySide6>=6.6",
+    "textual>=0.86",
     "pytest>=8.0",
     "pytest-qt>=4.2",
     "responses>=0.24",
@@ -29,6 +33,7 @@ dev = [
 
 [project.scripts]
 bilibili-downloader = "bilibili_downloader.__main__:main"
+biliflow-cli = "bilibili_downloader.__main__:cli_main"
 
 [tool.setuptools.packages.find]
 include = ["bilibili_downloader*"]

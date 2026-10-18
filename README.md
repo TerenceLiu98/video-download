@@ -16,7 +16,8 @@
 |---|---|---|
 | macOS 12+（Apple Silicon） | `BilibiliDownloader-macOS-<version>.zip` | 解压后打开 `BilibiliDownloader.app` |
 | Windows 10/11（x64） | `BilibiliDownloader-Windows-<version>.zip` | 完整解压后运行目录内的 `BilibiliDownloader.exe` |
-| Linux | 暂无预构建包 | 按下方“从源码运行”操作 |
+| Linux | 暂无图形界面预构建包 | 按下方“从源码运行”操作 |
+| 纯命令行（macOS / Windows / Linux） | `biliflow-cli-<系统>-<version>.zip` | 解压后在终端运行 `biliflow-cli --help` |
 
 Release 同时提供 `SHA256SUMS.txt`。下载后可核对安装包完整性：
 
@@ -114,9 +115,19 @@ TUI 下载任务会保存在配置目录的 `tui-tasks.json`，重启后未完�
 退出时会先停止派发任务、中断正在等待的媒体请求和 API 风控退避，再在后台保存最终记录。
 退出进度窗口会保持响应；保存失败时可重试。等待下载的任务不会提前占用下载线程。
 
-CLI 示例：
+CLI 示例（`biliflow-cli` 为不依赖 GUI/TUI 的纯命令行入口，`pip install .` 即可使用；
+需要图形界面或 TUI 时安装 `".[all]"`）：
 
 ```bash
+# 扫码登录 / 查看登录状态 / 退出登录
+biliflow-cli login
+biliflow-cli login --status
+biliflow-cli logout
+
+# 批量下载：链接作为参数，或从文件读取（每行一个），3 个并发
+biliflow-cli batch BV1GJ411x7h7 https://b23.tv/example
+biliflow-cli batch --file links.txt -j 3 --danmaku --subtitle
+
 # 只解析元数据
 python -m bilibili_downloader test BV1GJ411x7h7
 

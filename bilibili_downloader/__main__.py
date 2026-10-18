@@ -62,13 +62,42 @@ def _default_log_dir():
     return Path.home() / ".local" / "share" / "biliflow" / "logs"
 
 
-def main():
-    """Main entry point. Supports both CLI and GUI modes."""
+def main(argv=None):
+    """Main entry point. Supports CLI, TUI and (default) GUI modes."""
     _configure_logging()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        _launch_gui()
+    else:
+        _dispatch(args)
 
+
+def cli_main(argv=None):
+    """Pure CLI entry point: never launches the GUI or TUI.
+
+    Only needs the headless dependencies (no PySide6 / Textual), so it works
+    over SSH, on servers and in the console-only release binary.
+    """
+    _configure_logging()
+    parser = build_parser(prog="biliflow-cli", include_tui=False)
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        raise SystemExit(2)
+    _dispatch(args)
+
+
+def build_parser(
+    *, prog: str = "bilibili-downloader", include_tui: bool = True
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="bilibili-downloader",
-        description="Bilibili video downloader - GUI, TUI, and CLI modes.",
+        prog=prog,
+        description=(
+            "Bilibili video downloader - GUI, TUI, and CLI modes."
+            if include_tui
+            else "Bilibili video downloader - command-line mode."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -142,6 +171,29 @@ def main():
     _add_download_options(creator_parser)
     _add_archive_options(creator_parser)
 
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="Download many videos from links given as arguments, a file, or stdin",
+    )
+    batch_parser.add_argument(
+        "sources",
+        nargs="*",
+        help="BV/AV numbers, Bilibili URLs or b23.tv short links",
+    )
+    batch_parser.add_argument(
+        "--file", "-f",
+        action="append",
+        default=[],
+        help="Text file with one link per line ('-' reads stdin); repeatable",
+    )
+    batch_parser.add_argument(
+        "--first-page",
+        action="store_true",
+        help="Only download P1 of multi-part videos (default: all parts)",
+    )
+    _add_download_options(batch_parser)
+    _add_archive_options(batch_parser)
+
     index_parser = subparsers.add_parser(
         "download-index",
         help="Download selected videos from an existing creator index",
@@ -159,10 +211,17 @@ def main():
         help="Login via QR code (rendered in terminal) or a pasted SESSDATA, "
         "saving credentials for CLI use without the GUI",
     )
-    login_parser.add_argument(
+    login_mode = login_parser.add_mutually_exclusive_group()
+    login_mode.add_argument(
         "--sessdata",
         help="Skip the QR flow and login with a SESSDATA cookie value directly",
     )
+    login_mode.add_argument(
+        "--status",
+        action="store_true",
+        help="Show the saved login state without logging in again",
+    )
+    subparsers.add_parser("logout", help="Remove saved Bilibili credentials")
 
     # --- rebuild-cache subcommand (rebuild resolve cache from existing info.json) ---
     rebuild_parser = subparsers.add_parser(
@@ -175,30 +234,34 @@ def main():
     )
 
     # --- tui subcommand (full-screen terminal UI) ---
-    subparsers.add_parser(
-        "tui",
-        help="Launch the full-screen terminal UI (Textual)",
-    )
+    if include_tui:
+        subparsers.add_parser(
+            "tui",
+            help="Launch the full-screen terminal UI (Textual)",
+        )
 
-    args = parser.parse_args()
+    return parser
 
+
+def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "test":
         _cli_test(args.source)
     elif args.command == "download":
         _cli_download(args)
     elif args.command == "creator":
         _cli_creator(args)
+    elif args.command == "batch":
+        _cli_batch(args)
     elif args.command == "download-index":
         _cli_download_index(args)
     elif args.command == "login":
         _cli_login(args)
+    elif args.command == "logout":
+        _cli_logout()
     elif args.command == "rebuild-cache":
         _cli_rebuild_cache(args)
     elif args.command == "tui":
         _launch_tui()
-    else:
-        # Default: launch GUI
-        _launch_gui()
 
 
 def _launch_tui() -> None:
@@ -206,8 +269,8 @@ def _launch_tui() -> None:
     try:
         from bilibili_downloader.tui import launch
     except ImportError:
-        print("Textual not installed. Install with: pip install textual")
-        print("Or use the GUI: bilibili-downloader   (no subcommand)")
+        print('Textual not installed. Install with: pip install "bilibili-downloader[tui]"')
+        print("Or use the command line: biliflow-cli --help")
         sys.exit(1)
     # The TUI owns the whole terminal; any stderr log line would corrupt it.
     # Keep the file handler, drop the console handler.
@@ -397,6 +460,12 @@ def _cli_login(args: argparse.Namespace) -> None:
         raise SystemExit(130)
 
 
+def _cli_logout() -> None:
+    from bilibili_downloader.cli.login import cli_logout
+
+    cli_logout()
+
+
 def _cli_rebuild_cache(args: argparse.Namespace) -> None:
     from bilibili_downloader.cli.rebuild_cache import cli_rebuild_cache
 
@@ -504,6 +573,47 @@ def _cli_download_index(args: argparse.Namespace) -> None:
         client.close()
 
 
+def _cli_batch(args: argparse.Namespace) -> None:
+    from pathlib import Path
+
+    from bilibili_downloader.api.client import BilibiliAPIClient
+    from bilibili_downloader.core.batch import BatchResolver, classify_batch_inputs
+    from bilibili_downloader.utils.config import ConfigManager
+
+    lines = list(args.sources)
+    for name in args.file:
+        try:
+            text = sys.stdin.read() if name == "-" else Path(name).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"无法读取 {name}：{exc}")
+            raise SystemExit(1) from exc
+        lines.extend(text.splitlines())
+    if not args.sources and not args.file and not sys.stdin.isatty():
+        lines.extend(sys.stdin.read().splitlines())
+
+    sources, invalid = classify_batch_inputs("\n".join(lines))
+    for line in invalid:
+        print(f"跳过无法识别的输入：{line}")
+    if not sources:
+        print("没有可下载的链接。用法：biliflow-cli batch <链接...> 或 --file links.txt")
+        raise SystemExit(1)
+
+    settings = ConfigManager().load()
+    output_dir = Path(args.output or settings.output_dir)
+    client = BilibiliAPIClient(sessdata=settings.sessdata or None)
+    resolver = BatchResolver(client)
+    tasks = [(source, source, lambda source=source: resolver.resolve_one(source)) for source in sources]
+    try:
+        _run_download_tasks(
+            client, settings, output_dir, tasks, args, all_pages=not args.first_page
+        )
+    except KeyboardInterrupt:
+        print("\nCancelled")
+        raise SystemExit(130)
+    finally:
+        client.close()
+
+
 def _select_entries(index, bvids: list[str]):
     wanted = {value.upper() for value in bvids}
     selected = [entry for entry in index.videos if entry.bvid.upper() in wanted]
@@ -514,6 +624,26 @@ def _select_entries(index, bvids: list[str]):
 
 
 def _download_creator_entries(client, settings, output_dir, index, entries, args) -> None:
+    tasks = [
+        (entry.bvid, entry.title, lambda bvid=entry.bvid: client.get_video_info(bvid))
+        for entry in entries
+    ]
+    _run_download_tasks(
+        client, settings, output_dir, tasks, args,
+        creator_mid=index.mid, creator_name=index.name,
+    )
+
+
+def _run_download_tasks(
+    client, settings, output_dir, tasks, args, *,
+    all_pages=True, creator_mid=0, creator_name="",
+) -> None:
+    """Download ``(label, title, resolve)`` tasks concurrently.
+
+    ``resolve`` runs inside the worker so metadata fetching overlaps with
+    downloads. A failing task is reported and the others continue; any
+    failure exits 1 after the summary.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from bilibili_downloader.core.download_service import DownloadService
@@ -522,19 +652,25 @@ def _download_creator_entries(client, settings, output_dir, index, entries, args
     quality = VideoQuality(args.quality)
     codec = args.codec or settings.default_video_codec
     jobs = _resolve_jobs(args, settings)
-    total = len(entries)
+    total = len(tasks)
     print(f"Downloading {total} video(s) with {jobs} concurrent job(s)...", flush=True)
+    # Concurrent \r progress bars overwrite each other; only draw one when
+    # downloads run one at a time.
+    progress = _print_progress if jobs == 1 else (lambda pct, text: None)
 
     # Each task gets its own DownloadService because the service holds
     # per-download mutable state (self._cancelled, downloader.last_*).
     # They share the httpx client (thread-safe); sidecar writes are serialized
     # per video and comment archives run one at a time process-wide.
-    def _process(position, entry):
+    def _process(position, label, resolve):
         service = DownloadService(
             client, str(output_dir), ffmpeg_path=settings.ffmpeg_path or None
         )
-        info = client.get_video_info(entry.bvid)
-        pages = [info.for_page(page) for page in info.pages] or [info]
+        info = resolve()
+        if all_pages:
+            pages = [info.for_page(page) for page in info.pages] or [info]
+        else:
+            pages = [info.for_page(info.pages[0])] if info.pages else [info]
         saved = []
         for page_info in pages:
             item = DownloadItem(
@@ -550,37 +686,39 @@ def _download_creator_entries(client, settings, output_dir, index, entries, args
                 embed_cover=_option(args, "embed_cover", settings.embed_cover),
                 refresh_sidecars=args.refresh_sidecars,
                 selected_subtitle_lan=args.subtitle_language,
-                creator_mid=index.mid,
-                creator_name=index.name,
+                creator_mid=creator_mid,
+                creator_name=creator_name,
             )
-            outcome = service.download(item, _print_progress)
+            outcome = service.download(item, progress)
             saved.append(outcome.video_path)
             for warning in outcome.warnings:
-                logger.warning("[%d/%d] %s: %s", position, total, entry.bvid, warning)
-        return position, entry, saved
+                logger.warning("[%d/%d] %s: %s", position, total, label, warning)
+        return info.title, saved
 
     failures = []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        future_to_entry = {
-            pool.submit(_process, pos, entry): entry
-            for pos, entry in enumerate(entries, start=1)
+        future_to_task = {
+            pool.submit(_process, pos, label, resolve): (pos, label, title)
+            for pos, (label, title, resolve) in enumerate(tasks, start=1)
         }
-        for future in as_completed(future_to_entry):
-            entry = future_to_entry[future]
+        for future in as_completed(future_to_task):
+            position, label, title = future_to_task[future]
+            if jobs == 1:
+                print(flush=True)  # end the progress bar line
             try:
-                position, _, saved = future.result()
-                print(f"[{position}/{total}] ✓ {entry.bvid} — {entry.title}", flush=True)
+                resolved_title, saved = future.result()
+                print(f"[{position}/{total}] ✓ {label} — {resolved_title or title}", flush=True)
                 for path in saved:
                     logger.info("[%d/%d] saved: %s", position, total, path)
             except Exception as exc:  # noqa: BLE001
-                failures.append((entry.bvid, str(exc)))
-                logger.error("下载失败 %s: %s", entry.bvid, exc)
-                print(f"✗ {entry.bvid} — {exc}", flush=True)
+                failures.append((label, str(exc)))
+                logger.error("下载失败 %s: %s", label, exc)
+                print(f"✗ {label} — {exc}", flush=True)
 
     if failures:
         print(f"\n{len(failures)} 个任务失败：", flush=True)
-        for bvid, err in failures:
-            print(f"  {bvid}: {err}", flush=True)
+        for label, err in failures:
+            print(f"  {label}: {err}", flush=True)
         raise SystemExit(1)
 
 
@@ -601,8 +739,8 @@ def _launch_gui():
         from bilibili_downloader.gui.resources.paths import asset_path
         from bilibili_downloader.gui.resources.theme import ThemeManager
     except ImportError:
-        print("PySide6 not installed. Install with: pip install PySide6")
-        print("Or use CLI mode: python -m bilibili_downloader test <BV_number>")
+        print('PySide6 not installed. Install with: pip install "bilibili-downloader[gui]"')
+        print("Or use the command line: biliflow-cli --help")
         sys.exit(1)
 
     app = QApplication(sys.argv)

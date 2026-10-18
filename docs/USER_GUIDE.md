@@ -74,12 +74,42 @@ TUI 提供与桌面界面一致的核心流程，包括单个视频解析、批�
 
 ## CLI
 
-查看命令：
+`biliflow-cli` 是纯命令行入口：不依赖 PySide6 和 Textual，不带参数时只打印帮助，
+不会启动图形界面，适合服务器、SSH 和脚本。获取方式任选其一：
+
+- 从 Release 下载 `biliflow-cli-<系统>-<version>.zip`，解压即得单文件可执行程序（macOS、Windows、Linux）。
+- 从源码只安装命令行依赖：`pip install .`；需要图形界面或 TUI 时改装 `".[gui]"`、`".[tui]"` 或 `".[all]"`。
+
+下文的 `python -m bilibili_downloader` 均可替换为 `biliflow-cli`。查看命令：
 
 ```bash
-python -m bilibili_downloader --help
-python -m bilibili_downloader download --help
+biliflow-cli --help
+biliflow-cli download --help
 ```
+
+登录（凭据与 GUI/TUI 共用，优先保存到系统凭据库）：
+
+```bash
+biliflow-cli login                    # 终端显示二维码，用 B 站 App 扫码
+biliflow-cli login --sessdata <值>    # 直接使用 SESSDATA
+biliflow-cli login --status           # 查看当前登录账号；未登录或已失效时退出码为 1
+biliflow-cli logout                   # 删除保存的凭据
+```
+
+批量下载任意链接：
+
+```bash
+# 链接直接作为参数
+biliflow-cli batch BV1GJ411x7h7 https://b23.tv/example av170001
+
+# 从文件读取，每行一个；可重复 --file，`-` 表示标准输入
+biliflow-cli batch --file links.txt -j 3 --danmaku --subtitle
+pbpaste | biliflow-cli batch
+```
+
+`batch` 会去重并跳过无法识别的行，默认下载多 P 视频的全部分 P（`--first-page` 只下载 P1），
+其余参数与 `creator`/`download-index` 相同。单个任务失败不会中断其他任务，结束时汇总失败项并以退出码 1 返回。
+`-j` 大于 1 时不绘制逐块进度条，只在每个视频完成时输出一行。
 
 只解析视频信息：
 

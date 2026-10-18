@@ -30,11 +30,49 @@ _POLL_TIMEOUT = 200.0
 
 def cli_login(args: argparse.Namespace) -> None:
     """Handle the ``login`` subcommand."""
+    if getattr(args, "status", False):
+        _print_status()
+        return
     sessdata = getattr(args, "sessdata", None)
     if sessdata:
         _login_with_sessdata(sessdata.strip())
     else:
         _login_with_qr()
+
+
+def cli_logout() -> None:
+    """Handle the ``logout`` subcommand: drop the saved SESSDATA."""
+    from bilibili_downloader.utils.config import ConfigManager
+
+    config = ConfigManager()
+    settings = config.load()
+    if not settings.sessdata:
+        print("当前未登录。", flush=True)
+        return
+    config.save(settings.model_copy(update={"sessdata": ""}))
+    print("已退出登录，保存的凭据已删除。", flush=True)
+
+
+def _print_status() -> None:
+    from bilibili_downloader.utils.config import ConfigManager
+
+    sessdata = ConfigManager().load().sessdata
+    if not sessdata:
+        print("当前未登录。运行 login 扫码登录。", flush=True)
+        raise SystemExit(1)
+    client = BilibiliAPIClient(sessdata=sessdata)
+    try:
+        nav = client.get_nav_info()
+    except Exception as exc:  # noqa: BLE001
+        print(f"无法检查登录状态：{exc}", flush=True)
+        raise SystemExit(1) from exc
+    finally:
+        client.close()
+    if not nav.get("isLogin"):
+        print("已保存的凭据无效或已过期，请重新运行 login。", flush=True)
+        raise SystemExit(1)
+    vip = "，大会员" if (nav.get("vipStatus") or 0) == 1 else ""
+    print(f"已登录：{nav.get('uname')}（UID {nav.get('mid')}{vip}）", flush=True)
 
 
 def _print_qr_terminal(url: str) -> None:
@@ -136,7 +174,8 @@ def _finalize(sessdata: str) -> None:
     else:
         print("\n登录成功。", flush=True)
     print("凭据已保存，现在可直接使用 CLI，无需打开 GUI：", flush=True)
-    print("  bilibili-downloader creator <UP主UID> --download-all", flush=True)
+    print("  biliflow-cli batch --file links.txt", flush=True)
+    print("  biliflow-cli creator <UP主UID> --download-all", flush=True)
 
 
 def _whoami(sessdata: str) -> tuple[str, str]:
@@ -149,5 +188,7 @@ def _whoami(sessdata: str) -> tuple[str, str]:
         return "", ""
     finally:
         client.close()
-    data = nav.get("data") or {}
-    return str(data.get("uname") or ""), str(data.get("mid") or "")
+    # get_nav_info() already unwraps the response's "data" field.
+    if not nav.get("isLogin"):
+        return "", ""
+    return str(nav.get("uname") or ""), str(nav.get("mid") or "")
