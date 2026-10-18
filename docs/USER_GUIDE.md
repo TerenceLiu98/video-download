@@ -111,6 +111,11 @@ pbpaste | biliflow-cli batch
 其余参数与 `creator`/`download-index` 相同。单个任务失败不会中断其他任务，结束时汇总失败项并以退出码 1 返回。
 `-j` 大于 1 时不绘制逐块进度条，只在每个视频完成时输出一行。
 
+重复运行是安全的：已下载的媒体会跳过（输出 `已存在，跳过`），只补齐缺失的元信息、封面、评论、弹幕或字幕。
+UP 主索引（`creator`/`download-index`）优先从 `index.resolvecache.json` 和各视频目录中的 `info.json` 读取视频信息，
+已完成的视频不会再请求 API；`batch`/`download` 仍需解析一次链接，但不会重新下载媒体。
+单视频下载的完成记录保存在输出目录的 `.biliflow-downloads.json`；删除对应 MP4 即可重新下载。
+
 只解析视频信息：
 
 ```bash

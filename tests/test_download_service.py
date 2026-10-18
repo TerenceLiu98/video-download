@@ -168,3 +168,33 @@ def test_media_ready_fires_before_sidecar_archiving(monkeypatch, tmp_path):
     )
 
     assert events == ["media_ready", "danmaku"]
+
+
+class MetadataAPI(FakeAPI):
+    def __init__(self):
+        super().__init__()
+        self.metadata_calls = 0
+
+    def get_video_info_raw(self, bvid):
+        self.metadata_calls += 1
+        return {"code": 0, "data": {"bvid": bvid}}
+
+
+def test_existing_metadata_archive_is_not_refetched(monkeypatch, tmp_path):
+    api = MetadataAPI()
+    service = DownloadService(api, str(tmp_path))
+    video_path = tmp_path / "video.mp4"
+    monkeypatch.setattr(service._downloader, "download", lambda item, cb: str(video_path))
+    item = DownloadItem(
+        video_info=VideoInfo(bvid="BV1xx", cid=1),
+        download_metadata=True,
+        download_cover=False,
+        embed_metadata=False,
+        embed_cover=False,
+    )
+
+    first = service.download(item, lambda _progress, _text: None)
+    second = service.download(item, lambda _progress, _text: None)
+
+    assert api.metadata_calls == 1
+    assert first.metadata_path == second.metadata_path == str(tmp_path / "video.info.json")

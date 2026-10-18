@@ -1,5 +1,6 @@
 """Tests for stream downloader retry helpers."""
 
+import json
 from pathlib import Path
 
 import httpx
@@ -485,3 +486,53 @@ def test_resume_after_quality_change_never_merges_stale_video(monkeypatch, tmp_p
 
     assert output.read_bytes() == b"H" * 100 + b"A" * 10
 
+
+
+class _NoNetworkAPI:
+    def get_play_url(self, *args, **kwargs):
+        raise AssertionError("finished download must not fetch stream URLs")
+
+
+def _standalone_item():
+    return DownloadItem(video_info=VideoInfo(bvid="BV1GJ411x7h7", cid=7, title="Song"))
+
+
+def test_finished_standalone_download_is_skipped_via_ledger(tmp_path):
+    from bilibili_downloader.core.completed import record_completed
+
+    item = _standalone_item()
+    finished = tmp_path / "Song (2).mp4"  # collision-renamed on its first run
+    finished.write_bytes(b"mp4")
+    record_completed(tmp_path, item, finished)
+
+    downloader = StreamDownloader(_NoNetworkAPI(), str(tmp_path))
+    result = downloader.download(item, lambda _p, _t: None)
+
+    assert Path(result) == finished
+    assert downloader.last_download_skipped
+
+
+def test_legacy_standalone_download_is_skipped_when_sidecar_matches(tmp_path):
+    from bilibili_downloader.core.completed import LEDGER_NAME
+
+    item = _standalone_item()
+    (tmp_path / "Song.mp4").write_bytes(b"mp4")
+    (tmp_path / "Song.info.json").write_text(
+        json.dumps({"data": {"bvid": "BV1GJ411x7h7"}}), encoding="utf-8"
+    )
+
+    downloader = StreamDownloader(_NoNetworkAPI(), str(tmp_path))
+    assert Path(downloader.download(item, lambda _p, _t: None)) == tmp_path / "Song.mp4"
+    assert "BV1GJ411x7h7:7" in json.loads((tmp_path / LEDGER_NAME).read_text("utf-8"))
+
+
+def test_same_title_from_another_video_is_downloaded_again(tmp_path):
+    item = _standalone_item()
+    (tmp_path / "Song.mp4").write_bytes(b"mp4")
+    (tmp_path / "Song.info.json").write_text(
+        json.dumps({"data": {"bvid": "BV1other"}}), encoding="utf-8"
+    )
+
+    downloader = StreamDownloader(_NoNetworkAPI(), str(tmp_path))
+    with pytest.raises(AssertionError, match="must not fetch"):
+        downloader.download(item, lambda _p, _t: None)

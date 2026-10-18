@@ -18,6 +18,7 @@ import httpx
 from bilibili_downloader.api.client import BilibiliAPIClient
 from bilibili_downloader.api.endpoints import USER_AGENT
 from bilibili_downloader.core.archive import ArtifactPaths
+from bilibili_downloader.core.completed import find_completed, record_completed
 from bilibili_downloader.core.errors import TransientDownloadError, is_transient_error
 from bilibili_downloader.core.ffmpeg import FFmpegManager
 from bilibili_downloader.core.models import DownloadItem, StreamInfo, VideoQuality
@@ -123,10 +124,18 @@ class StreamDownloader:
         self.last_audio_stream = None
 
         stable_output = ArtifactPaths(self._output_dir, item).media_path
-        if stable_output is not None and stable_output.is_file() and stable_output.stat().st_size > 0:
+        if stable_output is not None:
+            existing = (
+                stable_output
+                if stable_output.is_file() and stable_output.stat().st_size > 0
+                else None
+            )
+        else:
+            existing = find_completed(self._output_dir, item)
+        if existing is not None:
             self.last_download_skipped = True
             progress_callback(1.0, "视频已存在，正在补齐归档文件...")
-            return str(stable_output)
+            return str(existing)
 
         progress_callback(0.0, "正在获取流地址...")
         playurl_data = self._fetch_play_url(item)
@@ -223,6 +232,8 @@ class StreamDownloader:
                 raise RuntimeError(f"FFmpeg merge failed: {msg}")
 
             merged_path.replace(output_path)
+            if stable_output is None:
+                record_completed(self._output_dir, item, output_path)
             shutil.rmtree(tmp, ignore_errors=True)
             _remove_empty_cache_root(tmp.parent)
 

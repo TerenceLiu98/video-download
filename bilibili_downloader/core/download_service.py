@@ -91,21 +91,7 @@ class DownloadService:
     ) -> DownloadOutcome:
         self._cancelled = False
         paths = ArtifactPaths(self._output_dir, item)
-        raw_metadata = None
         preparation_warnings: list[str] = []
-
-        if item.download_metadata:
-            progress_callback(0.01, "正在获取原始元信息...")
-            try:
-                raw_metadata = self._api_client.get_video_info_raw(
-                    item.video_info.bvid
-                )
-            except OperationCancelled:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self._raise_if_cancelled()
-                logger.warning("Metadata archive failed for %s: %s", item.video_info.bvid, exc)
-                preparation_warnings.append(f"元信息获取失败：{exc}")
 
         cover_for_merge = self._prepare_cover(item, paths, preparation_warnings)
         media_metadata = _media_metadata(item) if item.embed_metadata else None
@@ -152,7 +138,6 @@ class DownloadService:
             item,
             paths,
             sidecars,
-            raw_metadata,
             cover_for_merge,
             outcome,
             progress_callback,
@@ -195,19 +180,13 @@ class DownloadService:
         item: DownloadItem,
         paths: ArtifactPaths,
         sidecars: dict[str, Path],
-        raw_metadata: Optional[dict],
         cover_for_merge: Optional[Path],
         outcome: DownloadOutcome,
         progress_callback: Callable[[float, str], None],
     ) -> None:
         with self._video_lock(sidecars["metadata"], progress_callback):
-            if item.download_metadata and raw_metadata is not None:
-                try:
-                    if _needs_write(sidecars["metadata"], item.refresh_sidecars):
-                        atomic_write_json(sidecars["metadata"], raw_metadata)
-                    outcome.metadata_path = str(sidecars["metadata"])
-                except Exception as exc:  # noqa: BLE001
-                    outcome.warnings.append(f"元信息保存失败：{exc}")
+            if item.download_metadata:
+                self._download_metadata(item, sidecars["metadata"], outcome, progress_callback)
 
             if item.download_cover and cover_for_merge is not None:
                 try:
@@ -232,6 +211,29 @@ class DownloadService:
 
             if item.download_subtitle:
                 self._download_subtitle(item, sidecars["subtitle"], outcome, progress_callback)
+
+    def _download_metadata(self, item, path, outcome, progress_callback) -> None:
+        # Only hit the API when the archive is missing, so re-running a
+        # finished batch costs no metadata requests.
+        if not _needs_write(path, item.refresh_sidecars):
+            outcome.metadata_path = str(path)
+            return
+        self._raise_if_cancelled()
+        progress_callback(0.84, "正在获取原始元信息...")
+        try:
+            raw_metadata = self._api_client.get_video_info_raw(item.video_info.bvid)
+        except OperationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._raise_if_cancelled()
+            logger.warning("Metadata archive failed for %s: %s", item.video_info.bvid, exc)
+            outcome.warnings.append(f"元信息获取失败：{exc}")
+            return
+        try:
+            atomic_write_json(path, raw_metadata)
+            outcome.metadata_path = str(path)
+        except Exception as exc:  # noqa: BLE001
+            outcome.warnings.append(f"元信息保存失败：{exc}")
 
     def _download_comments(self, item, path, outcome, progress_callback) -> None:
         if not item.refresh_sidecars and _comments_complete(path):

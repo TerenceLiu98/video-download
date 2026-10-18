@@ -303,3 +303,45 @@ def test_login_status_without_credentials_exits_nonzero(monkeypatch, capsys):
         cli_login_module.cli_login(argparse.Namespace(status=True, sessdata=None))
     assert exc_info.value.code == 1
     assert "当前未登录" in capsys.readouterr().out
+
+
+def test_creator_rerun_resolves_finished_videos_from_archive_offline(monkeypatch, tmp_path):
+    import json
+
+    bvid = "BV1GJ411x7h7"
+    index = _make_index(1)
+    index.videos[0].bvid = bvid
+    video_dir = tmp_path / "UP_1" / f"[{bvid}] v0"
+    video_dir.mkdir(parents=True)
+    (video_dir / "info.json").write_text(
+        json.dumps({"code": 0, "data": {"bvid": bvid, "cid": 5, "title": "v0", "pages": [
+            {"cid": 5, "page": 1, "part": "v0"},
+        ]}}),
+        encoding="utf-8",
+    )
+
+    class OfflineClient:
+        def get_video_info(self, bvid):
+            raise AssertionError("archived video must not be re-resolved online")
+
+    seen = []
+
+    class FakeService:
+        def __init__(self, client, output_dir, ffmpeg_path=None):
+            pass
+
+        def download(self, item, callback):
+            seen.append(item.video_info.cid)
+            return DownloadOutcome(video_path=str(video_dir / "P01.mp4"), skipped_media=True)
+
+    monkeypatch.setattr(
+        "bilibili_downloader.core.download_service.DownloadService", FakeService
+    )
+    cli._download_creator_entries(
+        OfflineClient(), AppSettings(output_dir=str(tmp_path)), tmp_path, index,
+        index.videos, _batch_args(tmp_path, jobs=1),
+    )
+
+    assert seen == [5]
+    # Later runs (CLI or TUI) hit the shared resolve cache directly.
+    assert (tmp_path / "UP_1" / "index.resolvecache.json").is_file()

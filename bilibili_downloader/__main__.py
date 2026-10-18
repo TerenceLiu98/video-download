@@ -624,14 +624,62 @@ def _select_entries(index, bvids: list[str]):
 
 
 def _download_creator_entries(client, settings, output_dir, index, entries, args) -> None:
+    import threading
+    from pathlib import Path
+
+    from bilibili_downloader.core.creator import creator_directory_name
+    from bilibili_downloader.tui.resolve_cache import ResolveCache
+
+    # Resolve from the local archive first (the resolve cache shared with the
+    # TUI, then each video's info.json) so re-running a finished index costs
+    # no API requests; only unseen videos hit the network.
+    creator_dir = Path(output_dir) / creator_directory_name(index.name, index.mid)
+    cache = ResolveCache.for_creator(output_dir, index)
+    cache_lock = threading.Lock()
+
+    def resolve(bvid):
+        with cache_lock:
+            info = cache.get(bvid)
+        if info is not None:
+            return info
+        info = _archived_video_info(creator_dir, bvid) or client.get_video_info(bvid)
+        with cache_lock:
+            cache.put(bvid, info)
+        return info
+
     tasks = [
-        (entry.bvid, entry.title, lambda bvid=entry.bvid: client.get_video_info(bvid))
+        (entry.bvid, entry.title, lambda bvid=entry.bvid: resolve(bvid))
         for entry in entries
     ]
-    _run_download_tasks(
-        client, settings, output_dir, tasks, args,
-        creator_mid=index.mid, creator_name=index.name,
-    )
+    try:
+        _run_download_tasks(
+            client, settings, output_dir, tasks, args,
+            creator_mid=index.mid, creator_name=index.name,
+        )
+    finally:
+        with cache_lock:
+            cache.save()
+
+
+def _archived_video_info(creator_dir, bvid):
+    """Parse ``VideoInfo`` from a previously archived ``[BV…] …/info.json``."""
+    import json
+
+    from bilibili_downloader.api.client import _parse_video_info
+
+    if not creator_dir.is_dir():
+        return None
+    for child in creator_dir.iterdir():
+        if not (child.is_dir() and child.name.startswith(f"[{bvid}] ")):
+            continue
+        try:
+            payload = json.loads((child / "info.json").read_text(encoding="utf-8"))
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict) and data.get("bvid") == bvid:
+                return _parse_video_info(bvid, data)
+        except (OSError, ValueError) as exc:
+            logger.debug("Ignoring archived info for %s: %s", bvid, exc)
+    return None
 
 
 def _run_download_tasks(
@@ -672,6 +720,7 @@ def _run_download_tasks(
         else:
             pages = [info.for_page(info.pages[0])] if info.pages else [info]
         saved = []
+        skipped = True
         for page_info in pages:
             item = DownloadItem(
                 video_info=page_info,
@@ -691,9 +740,10 @@ def _run_download_tasks(
             )
             outcome = service.download(item, progress)
             saved.append(outcome.video_path)
+            skipped = skipped and outcome.skipped_media
             for warning in outcome.warnings:
                 logger.warning("[%d/%d] %s: %s", position, total, label, warning)
-        return info.title, saved
+        return info.title, saved, skipped
 
     failures = []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -706,8 +756,12 @@ def _run_download_tasks(
             if jobs == 1:
                 print(flush=True)  # end the progress bar line
             try:
-                resolved_title, saved = future.result()
-                print(f"[{position}/{total}] ✓ {label} — {resolved_title or title}", flush=True)
+                resolved_title, saved, skipped = future.result()
+                note = "（已存在，跳过）" if skipped else ""
+                print(
+                    f"[{position}/{total}] ✓ {label} — {resolved_title or title}{note}",
+                    flush=True,
+                )
                 for path in saved:
                     logger.info("[%d/%d] saved: %s", position, total, path)
             except Exception as exc:  # noqa: BLE001
