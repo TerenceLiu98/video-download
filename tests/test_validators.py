@@ -164,3 +164,46 @@ def test_trusted_https_url_does_not_trust_partner_parent_domain():
         trusted_https_url(
             "https://mountaintoys.cn/video.m4s", BILIBILI_RESOURCE_HOSTS
         )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/video.m4s?hdnts=x",
+        "https://upos-sz-mirrorakam.akamaized.net/upgcxcode/audio.m4s",
+        "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/video.m4s",
+    ],
+)
+def test_trusted_media_url_accepts_bilibili_akamai_mirrors(url):
+    assert trusted_media_url(url, BILIBILI_RESOURCE_HOSTS).startswith(
+        "https://upos-"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.akamaized.net/video.m4s",
+        "https://upos-hz-mirrorakam.akamaized.net.example.org/video.m4s",
+        "https://x.upos-hz-mirrorakam.akamaized.net/video.m4s",
+        "https://akamaized.net/video.m4s",
+        "https://user:pass@upos-hz-mirrorakam.akamaized.net/video.m4s",
+        "https://upos-hz-mirrorakam.akamaized.net:8443/video.m4s",
+    ],
+)
+def test_trusted_media_url_rejects_other_akamai_destinations(url):
+    with pytest.raises(ValueError):
+        trusted_media_url(url, BILIBILI_RESOURCE_HOSTS)
+
+
+def test_akamai_mirrors_stay_untrusted_for_cookie_bearing_requests():
+    with pytest.raises(ValueError, match="不受信任"):
+        trusted_https_url(
+            "https://upos-hz-mirrorakam.akamaized.net/sub.json", BILIBILI_RESOURCE_HOSTS
+        )
+
+
+def test_trusted_media_url_accepts_protocol_relative_cdn_url():
+    assert trusted_media_url(
+        "//upos-sz-mirrorcos.bilivideo.com/video.m4s", BILIBILI_RESOURCE_HOSTS
+    ) == "https://upos-sz-mirrorcos.bilivideo.com/video.m4s"
